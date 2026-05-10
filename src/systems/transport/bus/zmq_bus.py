@@ -54,8 +54,20 @@ class ZmqBus(MessageBus):
             lambda: deque(maxlen=self._retained_control_limit if self._retained_control_limit > 0 else None)
         )
         self._health = TransportHealthTracker()
-        self._control_socket = self._build_control_socket(timeout_ms=int(control_timeout_ms), identity=str(identity))
-        self._telemetry_socket = self._build_telemetry_socket(timeout_ms=int(telemetry_timeout_ms))
+        self._control_socket = None
+        self._telemetry_socket = None
+        try:
+            self._control_socket = self._build_control_socket(timeout_ms=int(control_timeout_ms), identity=str(identity))
+            self._telemetry_socket = self._build_telemetry_socket(timeout_ms=int(telemetry_timeout_ms))
+        except Exception:
+            if self._telemetry_socket is not None:
+                self._telemetry_socket.close(linger=0)
+                self._telemetry_socket = None
+            if self._control_socket is not None:
+                self._control_socket.close(linger=0)
+                self._control_socket = None
+            raise
+
         self._poller = zmq.Poller()
         self._poller.register(self._control_socket, zmq.POLLIN)
         if self._telemetry_socket is not None:
@@ -99,7 +111,10 @@ class ZmqBus(MessageBus):
     def close(self) -> None:
         if self._telemetry_socket is not None:
             self._telemetry_socket.close(linger=0)
-        self._control_socket.close(linger=0)
+            self._telemetry_socket = None
+        if self._control_socket is not None:
+            self._control_socket.close(linger=0)
+            self._control_socket = None
 
     def _build_control_socket(self, *, timeout_ms: int, identity: str):
         socket_type = self._zmq.ROUTER if self._role == "bridge" else self._zmq.DEALER

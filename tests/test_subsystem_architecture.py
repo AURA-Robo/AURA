@@ -14,7 +14,7 @@ SUBSYSTEMS = {
     "memory",
     "navigation",
     "perception",
-    "planner",
+    "reasoning",
     "shared",
     "transport",
     "world_state",
@@ -33,9 +33,6 @@ REMOVED_LAYER_DIRS = (
     SYSTEMS_ROOT / "inference" / "domain",
     SYSTEMS_ROOT / "inference" / "infrastructure",
     SYSTEMS_ROOT / "inference" / "bin",
-    SYSTEMS_ROOT / "planner" / "application",
-    SYSTEMS_ROOT / "planner" / "domain",
-    SYSTEMS_ROOT / "planner" / "infrastructure",
     SYSTEMS_ROOT / "perception" / "application",
     SYSTEMS_ROOT / "perception" / "infrastructure",
     SYSTEMS_ROOT / "world_state" / "application",
@@ -70,12 +67,13 @@ def test_runtime_subsystems_and_canonical_launchers_exist() -> None:
         assert (REPO_ROOT / "src" / service).is_dir()
     assert EXTERNAL_DASHBOARD_ROOT.is_dir()
     assert (RUN_SCRIPTS_ROOT / "inference_system_windows.bat").is_file()
-    assert (RUN_SCRIPTS_ROOT / "planner_system_windows.bat").is_file()
+    assert (RUN_SCRIPTS_ROOT / "reasoning_system_windows.bat").is_file()
     assert (RUN_SCRIPTS_ROOT / "navigation_system_windows.bat").is_file()
     assert (RUN_SCRIPTS_ROOT / "control_runtime_windows.bat").is_file()
     assert (RUN_SCRIPTS_ROOT / "runtime_windows.ps1").is_file()
     assert (RUN_SCRIPTS_ROOT / "backend_windows.ps1").is_file()
     assert (RUN_SCRIPTS_ROOT / "dashboard_dev_windows.ps1").is_file()
+    assert (RUN_SCRIPTS_ROOT / "run_dashboard_windows.ps1").is_file()
 
 
 def test_old_operational_surfaces_are_removed() -> None:
@@ -85,6 +83,7 @@ def test_old_operational_surfaces_are_removed() -> None:
     assert not (SYSTEMS_ROOT / "navigation" / "api" / "navdp_server.py").exists()
     assert not (SYSTEMS_ROOT / "runtime_supervisor").exists()
     assert not (REPO_ROOT / "scripts" / "serve_planner_qwen3_nothink.ps1").exists()
+    assert not (SYSTEMS_ROOT / "planner").exists()
     assert not (SYSTEMS_ROOT / "control" / "bin" / "send_internvla_nav_command_windows.bat").exists()
     assert not (RUN_SCRIPTS_ROOT / "inference_stack_windows.bat").exists()
     assert not (RUN_SCRIPTS_ROOT / "dashboard_backend_windows.ps1").exists()
@@ -136,6 +135,14 @@ def test_perception_does_not_depend_on_navigation_geometry() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         targets = set(_import_targets(tree))
         assert blocked_targets.isdisjoint(targets), (path, sorted(targets & blocked_targets))
+
+
+def test_world_state_does_not_import_navigation_facades() -> None:
+    for path in (SYSTEMS_ROOT / "world_state").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        targets = _import_targets(tree)
+        for target in targets:
+            assert not target.startswith("systems.navigation."), (path, target)
 
 
 def test_control_subsystem_does_not_import_simulation_modules() -> None:

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from systems.memory.api.runtime import ShortTermMemory, decode_rgb_history_npz, encode_rgb_history_npz
-from systems.navigation.goals import RobotState2D
+from systems.shared.contracts.navigation import RobotState2D
 
 
 def _planner_input(frame_id: int):

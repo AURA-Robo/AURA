@@ -36,6 +36,21 @@ def test_shared_memory_ring_roundtrip() -> None:
         writer.close(unlink=True)
 
 
+def test_shared_memory_ring_reclaims_stale_writer_segment() -> None:
+    name = f"isaac_aura_test_{uuid.uuid4().hex[:12]}"
+    stale_writer = SharedMemoryRing(name=name, slot_size=1024, capacity=4, create=True)
+    stale_writer.close(unlink=False)
+
+    writer = SharedMemoryRing(name=name, slot_size=1024, capacity=4, create=True)
+    reader = SharedMemoryRing(name=name, slot_size=1024, capacity=4, create=False)
+    try:
+        ref = writer.write(b"fresh-payload")
+        assert reader.read(ref) == b"fresh-payload"
+    finally:
+        reader.close()
+        writer.close(unlink=True)
+
+
 def test_zmq_bus_roundtrip() -> None:
     pytest.importorskip("zmq")
     port = _free_tcp_port()
@@ -89,6 +104,31 @@ def test_zmq_bus_roundtrip() -> None:
     finally:
         client.close()
         server.close()
+
+
+def test_zmq_bus_closes_control_socket_when_telemetry_bind_fails() -> None:
+    pytest.importorskip("zmq")
+    control_port = _free_tcp_port()
+    telemetry_port = _free_tcp_port()
+    control_endpoint = f"tcp://127.0.0.1:{control_port}"
+    telemetry_endpoint = f"tcp://127.0.0.1:{telemetry_port}"
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", telemetry_port))
+    blocker.listen(1)
+    try:
+        with pytest.raises(Exception):
+            ZmqBus(control_endpoint=control_endpoint, telemetry_endpoint=telemetry_endpoint, role="bridge")
+    finally:
+        blocker.close()
+
+    replacement_telemetry_endpoint = f"tcp://127.0.0.1:{_free_tcp_port()}"
+    server = ZmqBus(
+        control_endpoint=control_endpoint,
+        telemetry_endpoint=replacement_telemetry_endpoint,
+        role="bridge",
+    )
+    server.close()
 
 
 def test_zmq_bus_late_agent_receives_buffered_control_message() -> None:

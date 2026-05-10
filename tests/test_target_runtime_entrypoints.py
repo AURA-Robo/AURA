@@ -47,9 +47,9 @@ def test_root_entrypoints_import_without_old_launcher_layout() -> None:
         "serve_navigation_system_smoke",
         REPO_ROOT / "src" / "systems" / "navigation" / "api" / "serve_navigation_system.py",
     )
-    planner_module = _load_module(
-        "serve_planner_system_smoke",
-        REPO_ROOT / "src" / "systems" / "planner" / "api" / "serve_planner_system.py",
+    reasoning_module = _load_module(
+        "serve_reasoning_system_smoke",
+        REPO_ROOT / "src" / "systems" / "reasoning" / "api" / "serve_reasoning_system.py",
     )
     backend_module = _load_module(
         "serve_backend_smoke",
@@ -67,9 +67,9 @@ def test_root_entrypoints_import_without_old_launcher_layout() -> None:
     navigation_args = navigation_module.build_arg_parser().parse_args(["--host", "127.0.0.1", "--port", "17882"])
     assert navigation_args.host == "127.0.0.1"
     assert navigation_args.port == 17882
-    planner_args = planner_module.build_arg_parser().parse_args(["--host", "127.0.0.1", "--port", "17881"])
-    assert planner_args.host == "127.0.0.1"
-    assert planner_args.port == 17881
+    reasoning_args = reasoning_module.build_arg_parser().parse_args(["--host", "127.0.0.1", "--port", "17881"])
+    assert reasoning_args.host == "127.0.0.1"
+    assert reasoning_args.port == 17881
     backend_args = backend_module.build_arg_parser().parse_args(["--host", "127.0.0.1", "--port", "18095"])
     assert backend_args.host == "127.0.0.1"
     assert backend_args.port == 18095

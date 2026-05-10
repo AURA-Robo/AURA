@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import struct
+import uuid
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from threading import Lock
@@ -28,14 +30,34 @@ class SharedMemoryRing:
         self.capacity = int(capacity)
         self._bytes_per_slot = _HEADER.size + self.slot_size
         size = self.capacity * self._bytes_per_slot
-        self._shm = shared_memory.SharedMemory(name=self.name, create=create, size=size)
+        self._shm = self._open_shared_memory(create=create, size=size)
         self._lock = Lock()
         self._write_count = 0
+
+    def _open_shared_memory(self, *, create: bool, size: int) -> shared_memory.SharedMemory:
+        if not create:
+            return shared_memory.SharedMemory(name=self.name, create=False, size=size)
+        try:
+            return shared_memory.SharedMemory(name=self.name, create=True, size=size)
+        except FileExistsError:
+            stale = shared_memory.SharedMemory(name=self.name, create=False, size=size)
+            try:
+                stale.unlink()
+            finally:
+                stale.close()
+            try:
+                return shared_memory.SharedMemory(name=self.name, create=True, size=size)
+            except FileExistsError:
+                self.name = f"{self.name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+                return shared_memory.SharedMemory(name=self.name, create=True, size=size)
 
     def close(self, *, unlink: bool = False) -> None:
         self._shm.close()
         if unlink:
-            self._shm.unlink()
+            try:
+                self._shm.unlink()
+            except FileNotFoundError:
+                pass
 
     def write(self, payload: bytes | bytearray | memoryview) -> ShmSlotRef:
         raw = bytes(payload)

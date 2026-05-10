@@ -6,6 +6,7 @@ import cv2
 from PIL import Image
 from matplotlib import colormaps as cm
 from .policy_network import NavDP_Policy
+from .tensorrt_acceleration import NavDPTensorRtEngineSpec, configure_navdp_tensorrt
 
 class NavDP_Agent:
     def __init__(self,
@@ -20,7 +21,10 @@ class NavDP_Agent:
                  device='cuda:0',
                  use_amp=False,
                  amp_dtype='float16',
-                 enable_tf32=False):
+                 enable_tf32=False,
+                 tensorrt_mode='off',
+                 tensorrt_engine_dir='',
+                 tensorrt_precision='fp16'):
         self.image_intrinsic = image_intrinsic
         self.device = device
         self.predict_size = predict_size
@@ -31,6 +35,11 @@ class NavDP_Agent:
         self._autocast_dtype = self._resolve_amp_dtype(amp_dtype)
         self._use_amp = bool(use_amp and self._cuda_available)
         self._enable_tf32 = bool(enable_tf32 and self._cuda_available)
+        self.tensorrt_status = {
+            "mode": str(tensorrt_mode or "off"),
+            "enabled": False,
+            "reason": "not_configured",
+        }
         if self._enable_tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -41,6 +50,61 @@ class NavDP_Agent:
         self.navi_former.load_state_dict(torch.load(navi_model,map_location=self.device),strict=False)
         self.navi_former.to(self.device)
         self.navi_former.eval()
+        self._configure_tensorrt(
+            mode=tensorrt_mode,
+            engine_dir=tensorrt_engine_dir,
+            precision=tensorrt_precision,
+            checkpoint_path=navi_model,
+            temporal_depth=temporal_depth,
+            heads=heads,
+            token_dim=token_dim,
+        )
+
+    def _configure_tensorrt(
+        self,
+        *,
+        mode,
+        engine_dir,
+        precision,
+        checkpoint_path,
+        temporal_depth,
+        heads,
+        token_dim,
+    ):
+        normalized_mode = str(mode or "off").strip().lower()
+        if normalized_mode == "off":
+            self.tensorrt_status = {
+                "mode": "off",
+                "enabled": False,
+                "reason": "disabled",
+            }
+            return
+        if not str(engine_dir or "").strip():
+            self.tensorrt_status = {
+                "mode": normalized_mode,
+                "enabled": False,
+                "reason": "missing_engine_dir",
+            }
+            if normalized_mode in {"required", "build"}:
+                raise RuntimeError("NavDP TensorRT mode requires --tensorrt-engine-dir.")
+            return
+        spec = NavDPTensorRtEngineSpec(
+            precision=str(precision or "fp16").strip().lower(),
+            batch_size=1,
+            sample_num=16,
+            memory_size=self.memory_size,
+            predict_size=self.predict_size,
+            token_dim=int(token_dim),
+            temporal_depth=int(temporal_depth),
+            heads=int(heads),
+        )
+        self.tensorrt_status = configure_navdp_tensorrt(
+            self.navi_former,
+            mode=normalized_mode,
+            engine_dir=engine_dir,
+            checkpoint_path=checkpoint_path,
+            spec=spec,
+        )
 
     @staticmethod
     def _resolve_amp_dtype(amp_dtype):

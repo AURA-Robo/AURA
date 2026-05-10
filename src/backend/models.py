@@ -9,6 +9,13 @@ import re
 from typing import Any
 
 from systems.shared.contracts.dashboard import LogRecord
+from systems.shared.contracts.service_endpoints import (
+    CONTROL_RUNTIME_ENDPOINT,
+    INFERENCE_SYSTEM_ENDPOINT,
+    NAVIGATION_SYSTEM_ENDPOINT,
+    REASONING_SYSTEM_ENDPOINT,
+    RUNTIME_ENDPOINT,
+)
 
 
 DEFAULT_EXECUTION_MODES = ["TALK", "NAV", "MEM_NAV", "EXPLORE", "IDLE"]
@@ -49,6 +56,7 @@ def build_bootstrap_data(*, api_base_url: str, dev_origin: str, webrtc_base_path
         "apiBaseUrl": normalized_base,
         "devOrigin": str(dev_origin),
         "webrtcBasePath": str(webrtc_base_path),
+        "reasoningRoutes": ["task", "dialogue", "clarification", "unsupported", "busy"],
         "plannerModes": ["interactive", "pointgoal"],
     }
 
@@ -251,7 +259,7 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
     scene_label = _scene_label(scene_preset)
     launch_mode = _string(session_config.get("launchMode"), "gui")
     active_instruction = _string(runtime.get("activeInstruction"))
-    planner_status = _string(runtime.get("plannerControlMode"), "idle") or "idle"
+    reasoning_status = _string(runtime.get("reasoningTaskStatus"), _string(runtime.get("plannerControlMode"), "idle")) or "idle"
     execution_mode = _string(runtime.get("executionMode"), "IDLE") or "IDLE"
     recovery_state = _string(runtime.get("recoveryState"), "NORMAL") or "NORMAL"
     current_subgoal_type = _string(current_subgoal.get("type"), "observation")
@@ -287,13 +295,13 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "linkedPolicies": 3,
         },
         {
-            "id": "source-planner-instruction",
-            "title": "Planner Instruction Feed",
+            "id": "source-reasoning-instruction",
+            "title": "Reasoning Instruction Feed",
             "type": "task",
             "status": "indexed" if active_instruction else "indexing",
-            "domain": "Planner",
-            "tags": [planner_status, execution_mode],
-            "summary": active_instruction or "Planner is idle and waiting for the next operator instruction.",
+            "domain": "Reasoning",
+            "tags": [reasoning_status, execution_mode],
+            "summary": active_instruction or "Reasoning is idle and waiting for the next operator instruction.",
             "addedAt": last_event_date,
             "linkedEntities": 2 if active_instruction else 1,
             "linkedPolicies": 1,
@@ -320,7 +328,7 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
                 _string(_as_dict(services.get("navdp")).get("status"), "inactive"),
                 _string(system2.get("status"), "inactive"),
             ],
-            "summary": "Live service health for nav, planner, and system2 modules.",
+            "summary": "Live service health for nav, reasoning, and system2 modules.",
             "addedAt": time.strftime("%Y-%m-%d", time.localtime(timestamp_s)),
             "linkedEntities": 3,
             "linkedPolicies": 0,
@@ -363,12 +371,12 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "description": "Current high-level execution mode reported by the runtime.",
         },
         {
-            "id": "term-planner-status",
-            "canonical": planner_status,
-            "aliases": [planner_status.replace("_", " ")],
+            "id": "term-reasoning-status",
+            "canonical": reasoning_status,
+            "aliases": [reasoning_status.replace("_", " ")],
             "category": "state",
-            "linkedEntity": "Planner Task",
-            "description": "Planner task state used to stage current workflow execution.",
+            "linkedEntity": "Reasoning Task",
+            "description": "Reasoning task state used to stage current workflow execution.",
         },
         {
             "id": "term-selected-target",
@@ -401,12 +409,12 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
     if active_instruction:
         objects.append(
             {
-                "id": "object-planner-target",
+                "id": "object-reasoning-target",
                 "name": current_subgoal_label,
-                "category": "Planner",
+                "category": "Reasoning",
                 "aliases": [current_subgoal_type],
                 "detectable": False,
-                "summary": "Current planner target or active workflow step.",
+                "summary": "Current reasoning target or active workflow step.",
             }
         )
 
@@ -425,7 +433,7 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "aliases": [current_subgoal_type],
             "zoneType": "Active Goal",
             "mapLinked": route_points > 0,
-            "summary": "Current goal context reported by planner and navigation services.",
+            "summary": "Current goal context reported by reasoning and navigation services.",
         },
         {
             "id": "place-memory-surface",
@@ -447,12 +455,12 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "summary": execution_mode,
         },
         {
-            "id": "state-planner",
-            "name": "planner.task_status",
-            "appliesTo": "Planner",
-            "allowedValues": ["idle", "running", "completed", "error"],
-            "detectionMethod": "Planner API",
-            "summary": planner_status,
+            "id": "state-reasoning",
+            "name": "reasoning.task_status",
+            "appliesTo": "Reasoning",
+            "allowedValues": ["idle", "running", "completed", "cancelled", "error"],
+            "detectionMethod": "Reasoning API",
+            "summary": reasoning_status,
         },
         {
             "id": "state-recovery",
@@ -498,7 +506,7 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "priority": "critical",
             "status": _policy_status(detection_enabled),
             "linkedEntities": [selected_class, "runtime.execution_mode"],
-            "description": "Enables or disables perception-driven detection output used by planner decisions.",
+            "description": "Enables or disables perception-driven detection output used by reasoning task decisions.",
         },
         {
             "id": "policy-recovery",
@@ -506,7 +514,7 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "targetTask": "Safety",
             "priority": "critical",
             "status": "active",
-            "linkedEntities": ["runtime.recovery_state", "planner.task_status"],
+            "linkedEntities": ["runtime.recovery_state", "reasoning.task_status"],
             "description": "Promotes safe-stop and retry behavior whenever runtime health falls below nominal state.",
         },
     ]
@@ -554,7 +562,8 @@ def build_dashboard_catalog(state: dict[str, Any]) -> dict[str, Any]:
         "lastUpdated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp_s)),
         "highlights": {
             "sceneLabel": scene_label,
-            "plannerStatus": planner_status,
+            "reasoningStatus": reasoning_status,
+            "plannerStatus": reasoning_status,
             "executionMode": execution_mode,
             "currentSubgoal": current_subgoal_label,
             "selectedTarget": selected_class,
@@ -576,14 +585,30 @@ class DashboardStateBuilder:
                 "active": False,
                 "startedAt": None,
                 "config": None,
+                "conversationId": None,
                 "lastEvent": event.to_dict(),
             },
             "processes": [],
             "runtime": {
                 "executionMode": "IDLE",
+                "reasoningTaskStatus": "idle",
                 "plannerControlMode": "idle",
+                "reasoningRoute": None,
+                "lastDialogueReplyAt": None,
+                "agentResponse": {
+                    "text": "",
+                    "route": None,
+                    "requestId": None,
+                    "conversationId": None,
+                    "error": None,
+                    "at": None,
+                },
                 "activeInstruction": "",
                 "routeState": {},
+                "memoryNavigationMode": None,
+                "resolvedMemoryObjectId": None,
+                "resolvedMemoryPoseAgeSec": None,
+                "reacquireState": None,
                 "lastStatusEvent": {"state": "inactive", "reason": "session not started"},
             },
             "sensors": {
@@ -601,8 +626,29 @@ class DashboardStateBuilder:
             },
             "memory": {
                 "memoryAwareTaskActive": False,
+                "memoryNavigationMode": None,
+                "resolvedMemoryObjectId": None,
+                "resolvedMemoryPoseAgeSec": None,
+                "reacquireState": None,
                 "objectCount": 0,
+                "objectMemoryEnabled": False,
+                "objectMemoryAvailable": False,
+                "observationCount": 0,
+                "lastPersistOk": None,
+                "lastObservedAt": None,
                 "placeCount": 0,
+                "knowledgeEnabled": False,
+                "agentMemoryEnabled": False,
+                "agentMemoryAvailable": False,
+                "agentMemoryCoreBlockCount": 0,
+                "agentMemoryArchivalPassageCount": 0,
+                "agentMemoryDegradedReason": None,
+                "publishedDocumentCount": 0,
+                "activeHardRuleCount": 0,
+                "lexiconEntryCount": 0,
+                "lastKnowledgeRefreshOk": None,
+                "lastAppliedRuleIds": [],
+                "knowledgeDegradedReason": None,
                 "semanticRuleCount": 0,
                 "scratchpad": {"taskState": "idle", "instruction": "", "nextPriority": "start session"},
             },
@@ -613,7 +659,7 @@ class DashboardStateBuilder:
                     "core": {
                         "worldStateStore": _node("World State Store", "inactive", "No snapshot", "runtime inactive", required=True),
                         "decisionEngine": _node("Decision Engine", "inactive", "No active task", "runtime inactive", required=True),
-                        "plannerCoordinator": _node("Planner Coordinator", "inactive", "Planner idle", "runtime inactive", required=True),
+                        "reasoningCoordinator": _node("Reasoning Coordinator", "inactive", "Reasoning idle", "runtime inactive", required=True),
                         "commandResolver": _node("Command Resolver", "inactive", "No active command", "runtime inactive", required=True),
                         "safetySupervisor": _node("Safety Supervisor", "inactive", "Recovery normal", "runtime inactive", required=True),
                     },
@@ -636,31 +682,29 @@ class DashboardStateBuilder:
                 "runtime": {
                     "name": "runtime",
                     "status": "inactive",
-                    "healthUrl": "http://127.0.0.1:18096/session/state",
+                    "healthUrl": RUNTIME_ENDPOINT.status_url(),
                 },
                 "controlRuntime": {
                     "name": "control_runtime",
                     "status": "inactive",
-                    "healthUrl": "http://127.0.0.1:8892/runtime/status",
+                    "healthUrl": CONTROL_RUNTIME_ENDPOINT.status_url(),
                 },
                 "inferenceSystem": {
                     "name": "inference_system",
                     "status": "inactive",
-                    "healthUrl": "http://127.0.0.1:15880/models/state",
+                    "healthUrl": INFERENCE_SYSTEM_ENDPOINT.status_url(),
                 },
                 "navigationSystem": {
                     "name": "navigation_system",
                     "status": "inactive",
-                    "healthUrl": "http://127.0.0.1:17882/navigation/status",
+                    "healthUrl": NAVIGATION_SYSTEM_ENDPOINT.status_url(),
                 },
-                "plannerSystem": {
-                    "name": "planner_system",
+                "reasoningSystem": {
+                    "name": "reasoning_system",
                     "status": "inactive",
-                    "healthUrl": "http://127.0.0.1:17881/planner/status",
+                    "healthUrl": REASONING_SYSTEM_ENDPOINT.status_url(),
                 },
                 "navdp": {"name": "navdp", "status": "inactive", "healthUrl": f"{self.api_base_url}/api/state"},
-                "planner": {"name": "planner", "status": "inactive", "healthUrl": f"{self.api_base_url}/api/state"},
-                "dual": {"name": "dual", "status": "inactive", "healthUrl": f"{self.api_base_url}/api/state"},
                 "system2": {"name": "system2", "status": "inactive", "healthUrl": f"{self.api_base_url}/api/state", "output": None},
             },
             "transport": {
@@ -671,7 +715,7 @@ class DashboardStateBuilder:
                 "peerActive": False,
                 "peerSessionId": None,
                 "peerTrackRoles": [],
-                "busHealth": {"control_endpoint": "tcp://127.0.0.1:5580", "telemetry_endpoint": "tcp://127.0.0.1:5581"},
+                "busHealth": {"control_endpoint": "tcp://127.0.0.1:18880", "telemetry_endpoint": "tcp://127.0.0.1:18881"},
             },
             "logs": [event.to_dict()],
             "selectedTargetSummary": None,

@@ -19,6 +19,13 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from systems.shared.contracts.dashboard import LogRecord, ProcessRecord
+from systems.shared.contracts.service_endpoints import (
+    CONTROL_RUNTIME_ENDPOINT,
+    INFERENCE_SYSTEM_ENDPOINT,
+    NAVIGATION_SYSTEM_ENDPOINT,
+    REASONING_SYSTEM_ENDPOINT,
+    RUNTIME_ENDPOINT,
+)
 
 
 CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -81,6 +88,8 @@ class ManagedProcess:
     process: subprocess.Popen[str]
     stdout_log: Path
     stderr_log: Path
+    stdout_log_offset: int
+    stderr_log_offset: int
     started_at: float
     health_url: str
     required: bool
@@ -96,6 +105,8 @@ class ManagedProcess:
             healthUrl=self.health_url,
             stdoutLog=str(self.stdout_log),
             stderrLog=str(self.stderr_log),
+            stdoutLogOffset=self.stdout_log_offset,
+            stderrLogOffset=self.stderr_log_offset,
         ).to_dict()
 
 
@@ -114,6 +125,8 @@ class RuntimeProcessRegistry:
             return current
         stdout_log = self._log_dir / f"{spec.name}.stdout.log"
         stderr_log = self._log_dir / f"{spec.name}.stderr.log"
+        stdout_log_offset = stdout_log.stat().st_size if stdout_log.is_file() else 0
+        stderr_log_offset = stderr_log.stat().st_size if stderr_log.is_file() else 0
         stdout_handle = open(stdout_log, "a", encoding="utf-8")
         stderr_handle = open(stderr_log, "a", encoding="utf-8")
         command = ["cmd.exe", "/d", "/c", str(spec.script_path)]
@@ -132,6 +145,8 @@ class RuntimeProcessRegistry:
             process=process,
             stdout_log=stdout_log,
             stderr_log=stderr_log,
+            stdout_log_offset=stdout_log_offset,
+            stderr_log_offset=stderr_log_offset,
             started_at=time.time(),
             health_url=spec.health_url,
             required=spec.required,
@@ -211,10 +226,71 @@ def _resolve_service_url(
     return f"http://{host}:{port}{suffix}".rstrip("/")
 
 
+def _host_port_from_url(url: str, *, default_host: str, default_port: int) -> tuple[str, str]:
+    candidate = str(url).strip()
+    if not candidate:
+        return default_host, str(default_port)
+    parsed = urlparse(candidate if "://" in candidate else f"http://{candidate}")
+    host = parsed.hostname or default_host
+    port = parsed.port if parsed.port is not None else default_port
+    return host, str(port)
+
+
+def _dialogue_prompt_only_env(base_env: Mapping[str, str]) -> str:
+    explicit = str(base_env.get("DIALOGUE_ALLOW_PROMPT_ONLY", "")).strip()
+    if explicit:
+        return explicit
+    lora_path = str(base_env.get("DIALOGUE_LORA_ADAPTER_PATH", "")).strip()
+    return "0" if lora_path else "1"
+
+
 def _bool_env(value: Any, *, default: bool) -> str:
     if value is None:
         return "1" if default else "0"
     return "1" if bool(value) else "0"
+
+
+def _isaac_runtime_env(base_env: Mapping[str, str]) -> dict[str, str]:
+    env = dict(base_env)
+    for key in (
+        "AURA_PYTHON",
+        "VIRTUAL_ENV",
+        "PYTHONHOME",
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
+        "CONDA_SHLVL",
+        "CONDA_PROMPT_MODIFIER",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def _launch_mode(session_config: Mapping[str, Any]) -> str:
+    mode = str(session_config.get("launchMode", "gui")).strip().lower()
+    return mode or "gui"
+
+
+def _positive_timeout_env(env: Mapping[str, str], key: str) -> float | None:
+    raw_value = str(env.get(key, "")).strip()
+    if raw_value == "":
+        return None
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return None
+    if parsed <= 0.0:
+        return None
+    return parsed
+
+
+def _control_runtime_start_timeout_s(
+    session_config: Mapping[str, Any],
+    base_env: Mapping[str, str],
+) -> float:
+    env_override = _positive_timeout_env(base_env, "AURA_CONTROL_RUNTIME_START_TIMEOUT_SECONDS")
+    if env_override is not None:
+        return env_override
+    return 180.0 if _launch_mode(session_config) == "gui" else 60.0
 
 
 def build_default_launchers(
@@ -223,6 +299,7 @@ def build_default_launchers(
     base_env: Mapping[str, str],
 ) -> list[LauncherSpec]:
     scripts_root = Path(repo_root) / "scripts" / "run_system"
+    launch_mode = _launch_mode(session_config)
     navdp_url = _resolve_service_url(
         base_env,
         explicit_key="NAVDP_URL",
@@ -248,32 +325,118 @@ def build_default_launchers(
         default_port=8093,
         suffix="/v1/chat/completions",
     )
+    reasoning_model_base_url = _resolve_service_url(
+        base_env,
+        explicit_key="DIALOGUE_MODEL_BASE_URL",
+        host_key="DIALOGUE_MODEL_HOST",
+        port_key="DIALOGUE_MODEL_PORT",
+        default_host="127.0.0.1",
+        default_port=8094,
+        suffix="/v1/chat/completions",
+    )
+    inference_url = _resolve_service_url(
+        base_env,
+        explicit_key="INFERENCE_SYSTEM_URL",
+        host_key="INFERENCE_SYSTEM_HOST",
+        port_key="INFERENCE_SYSTEM_PORT",
+        default_host=INFERENCE_SYSTEM_ENDPOINT.host,
+        default_port=INFERENCE_SYSTEM_ENDPOINT.port,
+    )
+    inference_host, inference_port = _host_port_from_url(
+        inference_url,
+        default_host=INFERENCE_SYSTEM_ENDPOINT.host,
+        default_port=INFERENCE_SYSTEM_ENDPOINT.port,
+    )
+    navdp_host, navdp_port = _host_port_from_url(
+        navdp_url,
+        default_host="127.0.0.1",
+        default_port=18888,
+    )
+    system2_host, system2_port = _host_port_from_url(
+        system2_url,
+        default_host="127.0.0.1",
+        default_port=15801,
+    )
+    planner_model_host, planner_model_port = _host_port_from_url(
+        planner_model_base_url,
+        default_host="127.0.0.1",
+        default_port=8093,
+    )
+    dialogue_model_host, dialogue_model_port = _host_port_from_url(
+        reasoning_model_base_url,
+        default_host="127.0.0.1",
+        default_port=8094,
+    )
+
+    inference_script = scripts_root / "inference_system_windows.bat"
+    inference_env = {
+        **dict(base_env),
+        "INFERENCE_SYSTEM_HOST": inference_host,
+        "INFERENCE_SYSTEM_PORT": inference_port,
+        "NAVDP_HOST": navdp_host,
+        "NAVDP_PORT": navdp_port,
+        "SYSTEM2_HOST": system2_host,
+        "SYSTEM2_PORT": system2_port,
+        "PLANNER_MODEL_HOST": planner_model_host,
+        "PLANNER_MODEL_PORT": planner_model_port,
+        "DIALOGUE_MODEL_HOST": dialogue_model_host,
+        "DIALOGUE_MODEL_PORT": dialogue_model_port,
+        "DIALOGUE_ALLOW_PROMPT_ONLY": _dialogue_prompt_only_env(base_env),
+    }
 
     navigation_script = scripts_root / "navigation_system_windows.bat"
     navigation_env = {
         **dict(base_env),
         "SYSTEM2_URL": system2_url,
         "NAVDP_URL": navdp_url,
-        "NAVIGATION_BACKEND_AUTOSTART": str(base_env.get("NAVIGATION_BACKEND_AUTOSTART", "1")),
+        "NAVIGATION_BACKEND_AUTOSTART": str(base_env.get("NAVIGATION_BACKEND_AUTOSTART", "0")),
     }
-    navigation_config = _launcher_json(navigation_script, navigation_env)
-    navigation_url = str(navigation_config["navigation_system_url"]).rstrip("/")
+    navigation_url = _resolve_service_url(
+        navigation_env,
+        explicit_key="NAVIGATION_SYSTEM_URL",
+        host_key="NAVIGATION_SYSTEM_HOST",
+        port_key="NAVIGATION_SYSTEM_PORT",
+        default_host=NAVIGATION_SYSTEM_ENDPOINT.host,
+        default_port=NAVIGATION_SYSTEM_ENDPOINT.port,
+    )
 
-    planner_script = scripts_root / "planner_system_windows.bat"
-    planner_env = {
+    reasoning_script = scripts_root / "reasoning_system_windows.bat"
+    reasoning_env = {
         **dict(base_env),
         "NAVIGATION_SYSTEM_URL": navigation_url,
         "PLANNER_MODEL_BASE_URL": planner_model_base_url,
+        "DIALOGUE_MODEL_BASE_URL": reasoning_model_base_url,
+        "AURA_SCENE_PRESET": str(session_config.get("scenePreset", "")),
     }
-    planner_config = _launcher_json(planner_script, planner_env)
-    planner_url = str(planner_config["planner_system_url"]).rstrip("/")
+    reasoning_url = _resolve_service_url(
+        reasoning_env,
+        explicit_key="REASONING_SYSTEM_URL",
+        host_key="REASONING_SYSTEM_HOST",
+        port_key="REASONING_SYSTEM_PORT",
+        default_host=REASONING_SYSTEM_ENDPOINT.host,
+        default_port=REASONING_SYSTEM_ENDPOINT.port,
+    )
 
     control_script = scripts_root / "control_runtime_windows.bat"
-    locomotion = session_config.get("locomotionConfig") if isinstance(session_config.get("locomotionConfig"), dict) else {}
+    locomotion = (
+        session_config.get("locomotionConfig")
+        if isinstance(session_config.get("locomotionConfig"), dict)
+        else {}
+    )
+    control_host = (
+        str(base_env.get("RUNTIME_CONTROL_API_HOST", CONTROL_RUNTIME_ENDPOINT.host)).strip()
+        or CONTROL_RUNTIME_ENDPOINT.host
+    )
+    control_port = str(base_env.get("RUNTIME_CONTROL_API_PORT", CONTROL_RUNTIME_ENDPOINT.port)).strip() or str(
+        CONTROL_RUNTIME_ENDPOINT.port
+    )
     control_env = {
-        **dict(base_env),
+        **_isaac_runtime_env(base_env),
+        "RUNTIME_CONTROL_API_HOST": control_host,
+        "RUNTIME_CONTROL_API_PORT": control_port,
         "NAVIGATION_URL": navigation_url,
-        "AURA_LAUNCH_MODE": str(session_config.get("launchMode", "gui")),
+        "AURA_LAUNCH_MODE": launch_mode,
+        "AURA_SCENE_PRESET": str(session_config.get("scenePreset", "")),
         "AURA_VIEWER_ENABLED": _bool_env(session_config.get("viewerEnabled"), default=True),
         "AURA_MEMORY_STORE": _bool_env(session_config.get("memoryStore"), default=False),
         "AURA_DETECTION_ENABLED": _bool_env(session_config.get("detectionEnabled"), default=True),
@@ -283,10 +446,29 @@ def build_default_launchers(
         "AURA_CMD_MAX_VY": _coerce_number(locomotion, "cmdMaxVy", 0.3),
         "AURA_CMD_MAX_WZ": _coerce_number(locomotion, "cmdMaxWz", 0.8),
     }
-    control_config = _launcher_json(control_script, control_env)
-    control_url = str(control_config["runtime_control_api_url"]).rstrip("/")
+    control_url = _resolve_service_url(
+        control_env,
+        explicit_key="RUNTIME_CONTROL_API_URL",
+        host_key="RUNTIME_CONTROL_API_HOST",
+        port_key="RUNTIME_CONTROL_API_PORT",
+        default_host=CONTROL_RUNTIME_ENDPOINT.host,
+        default_port=CONTROL_RUNTIME_ENDPOINT.port,
+    )
 
     return [
+        LauncherSpec(
+            name="inference_system",
+            script_path=inference_script,
+            env=inference_env,
+            health_url=f"{inference_url}/healthz",
+            endpoints={
+                "inferenceSystemUrl": inference_url,
+                "plannerModelUrl": planner_model_base_url,
+                "dialogueModelUrl": reasoning_model_base_url,
+            },
+            wait_for_health=False,
+            start_timeout_s=30.0,
+        ),
         LauncherSpec(
             name="navigation_system",
             script_path=navigation_script,
@@ -301,11 +483,11 @@ def build_default_launchers(
             start_timeout_s=30.0,
         ),
         LauncherSpec(
-            name="planner_system",
-            script_path=planner_script,
-            env=planner_env,
-            health_url=f"{planner_url}/healthz",
-            endpoints={"plannerSystemUrl": planner_url},
+            name="reasoning_system",
+            script_path=reasoning_script,
+            env=reasoning_env,
+            health_url=f"{reasoning_url}/healthz",
+            endpoints={"reasoningSystemUrl": reasoning_url},
             wait_for_health=False,
             start_timeout_s=30.0,
         ),
@@ -315,7 +497,7 @@ def build_default_launchers(
             env=control_env,
             health_url=f"{control_url}/healthz",
             endpoints={"controlRuntimeUrl": control_url},
-            start_timeout_s=60.0,
+            start_timeout_s=_control_runtime_start_timeout_s(session_config, base_env),
         ),
     ]
 
@@ -391,7 +573,7 @@ class RuntimeService:
     def stop_session(self) -> dict[str, object]:
         with self._lock:
             self._session_state = "stopping"
-            self._registry.stop_many(["control_runtime", "planner_system", "navigation_system"])
+            self._registry.stop_many(["inference_system", "navigation_system", "reasoning_system", "control_runtime"])
             self._session_state = "inactive"
             self._session_config = None
             self._started_at = None
@@ -510,8 +692,8 @@ class RuntimeServer:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the runtime service.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18096)
+    parser.add_argument("--host", default=RUNTIME_ENDPOINT.host)
+    parser.add_argument("--port", type=int, default=RUNTIME_ENDPOINT.port)
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     return parser
 

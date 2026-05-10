@@ -19,6 +19,15 @@ from urllib.request import Request, urlopen
 from systems.inference.stack.config import REPO_ROOT, build_managed_services, default_log_dir
 from systems.inference.stack.process_registry import ProcessRegistry
 
+TRUE_VALUES = frozenset(("1", "true", "yes", "on"))
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return str(raw_value).strip().lower() in TRUE_VALUES
+
 
 def _json_get(url: str, *, timeout_s: float) -> tuple[str, dict[str, Any] | None, float | None, str | None]:
     started = time.perf_counter()
@@ -198,12 +207,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-dir", default=str(default_log_dir()))
     parser.add_argument("--navdp-host", default="127.0.0.1")
     parser.add_argument("--navdp-port", type=int, default=18888)
-    parser.add_argument("--navdp-checkpoint", default=str(REPO_ROOT / "navdp-cross-modal.ckpt"))
+    parser.add_argument("--navdp-checkpoint", default=str(REPO_ROOT / "artifacts" / "models" / "navdp-cross-modal.ckpt"))
     parser.add_argument("--navdp-device", default="cuda:0")
+    parser.add_argument(
+        "--navdp-tensorrt-mode",
+        choices=("off", "auto", "required", "build"),
+        default=os.environ.get("NAVDP_TENSORRT_MODE", "off"),
+    )
+    parser.add_argument(
+        "--navdp-tensorrt-engine-dir",
+        default=os.environ.get(
+            "NAVDP_TENSORRT_ENGINE_DIR",
+            str(REPO_ROOT / "artifacts" / "models" / "navdp_tensorrt"),
+        ),
+    )
+    parser.add_argument(
+        "--navdp-tensorrt-precision",
+        choices=("fp16", "fp32"),
+        default=os.environ.get("NAVDP_TENSORRT_PRECISION", "fp16"),
+    )
     parser.add_argument("--system2-host", default="127.0.0.1")
     parser.add_argument("--system2-port", type=int, default=15801)
     parser.add_argument("--system2-llama-url", default="http://127.0.0.1:15802")
     parser.add_argument("--system2-model-path", default="")
+    parser.add_argument(
+        "--system2-check-lora-adapter-path",
+        default=os.environ.get(
+            "SYSTEM2_CHECK_LORA_ADAPTER_PATH",
+            os.environ.get("INTERNVLA_CHECK_LORA_ADAPTER_PATH", ""),
+        ),
+    )
+    parser.add_argument(
+        "--system2-check-lora-scale",
+        type=float,
+        default=float(
+            os.environ.get(
+                "SYSTEM2_CHECK_LORA_SCALE",
+                os.environ.get("INTERNVLA_CHECK_LORA_SCALE", "1.0"),
+            )
+            or 1.0
+        ),
+    )
+    parser.add_argument(
+        "--system2-check-session-system-prompt",
+        default=os.environ.get(
+            "SYSTEM2_CHECK_SESSION_SYSTEM_PROMPT",
+            os.environ.get("INTERNVLA_CHECK_SESSION_SYSTEM_PROMPT", ""),
+        ),
+    )
     parser.add_argument("--planner-host", default="127.0.0.1")
     parser.add_argument("--planner-port", type=int, default=8093)
     parser.add_argument("--planner-model-path", default=str(REPO_ROOT / "artifacts" / "models" / "Qwen3-1.7B-Q4_K_M-Instruct.gguf"))
@@ -211,8 +262,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--planner-llama-server", default=str(planner_default))
     parser.add_argument("--planner-gpu-layers", type=int, default=999)
     parser.add_argument("--planner-ctx-size", type=int, default=1024)
+    parser.add_argument(
+        "--planner-parallel-slots",
+        type=int,
+        default=int(os.environ.get("PLANNER_PARALLEL_SLOTS", "2") or 2),
+    )
     parser.add_argument("--planner-cache-type-k", default="q8_0")
     parser.add_argument("--planner-cache-type-v", default="q8_0")
+    parser.add_argument("--dialogue-host", default="127.0.0.1")
+    parser.add_argument("--dialogue-port", type=int, default=8094)
+    parser.add_argument("--dialogue-model-path", default=str(REPO_ROOT / "artifacts" / "models" / "Qwen3-1.7B-Q4_K_M-Instruct.gguf"))
+    parser.add_argument("--dialogue-llama-server", default=str(planner_default))
+    parser.add_argument("--dialogue-gpu-layers", type=int, default=999)
+    parser.add_argument("--dialogue-ctx-size", type=int, default=1024)
+    parser.add_argument("--dialogue-cache-type-k", default="q8_0")
+    parser.add_argument("--dialogue-cache-type-v", default="q8_0")
+    parser.add_argument("--dialogue-lora-adapter-path", default=os.environ.get("DIALOGUE_LORA_ADAPTER_PATH", ""))
+    parser.add_argument(
+        "--dialogue-allow-prompt-only",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("DIALOGUE_ALLOW_PROMPT_ONLY"),
+    )
     return parser
 
 

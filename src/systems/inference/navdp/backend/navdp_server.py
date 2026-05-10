@@ -24,9 +24,27 @@ parser.add_argument("--port", type=int, default=18888)
 parser.add_argument(
     "--checkpoint",
     type=str,
-    default=str(PROJECT_ROOT / "navdp-cross-modal.ckpt"),
+    default=str(PROJECT_ROOT / "artifacts" / "models" / "navdp-cross-modal.ckpt"),
 )
 parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument(
+    "--tensorrt-mode",
+    choices=("off", "auto", "required", "build"),
+    default=os.environ.get("NAVDP_TENSORRT_MODE", "off"),
+    help="Optional TensorRT mode for NavDP noise prediction: off, auto, required, or build.",
+)
+parser.add_argument(
+    "--tensorrt-engine-dir",
+    type=str,
+    default=os.environ.get("NAVDP_TENSORRT_ENGINE_DIR", str(PROJECT_ROOT / "artifacts" / "models" / "navdp_tensorrt")),
+    help="Directory containing or receiving NavDP TensorRT engine artifacts.",
+)
+parser.add_argument(
+    "--tensorrt-precision",
+    choices=("fp16", "fp32"),
+    default=os.environ.get("NAVDP_TENSORRT_PRECISION", "fp16"),
+    help="TensorRT builder precision for generated NavDP engines.",
+)
 parser.add_argument(
     "--save_debug_video",
     action="store_true",
@@ -63,6 +81,17 @@ def healthz():
             "navigator_ready": navdp_navigator is not None,
             "supports_pixelgoal": bool(capabilities is not None and capabilities.supports_pixelgoal),
             "supports_imagegoal": bool(capabilities is not None and capabilities.supports_imagegoal),
+            "tensorrt": (
+                getattr(navdp_navigator, "tensorrt_status", None)
+                if navdp_navigator is not None
+                else {
+                    "mode": args.tensorrt_mode,
+                    "enabled": False,
+                    "engine_dir": args.tensorrt_engine_dir,
+                    "precision": args.tensorrt_precision,
+                    "reason": "navigator_not_initialized",
+                }
+            ),
         }
     )
 
@@ -186,6 +215,9 @@ def navdp_reset():
             token_dim=384,
             navi_model=args.checkpoint,
             device=args.device,
+            tensorrt_mode=args.tensorrt_mode,
+            tensorrt_engine_dir=args.tensorrt_engine_dir,
+            tensorrt_precision=args.tensorrt_precision,
         )
     navdp_navigator.reset(batchsize, threshold)
     _reset_debug_writer()
@@ -195,6 +227,7 @@ def navdp_reset():
             "algo": "navdp",
             "supports_pixelgoal": bool(capabilities is not None and capabilities.supports_pixelgoal),
             "supports_imagegoal": bool(capabilities is not None and capabilities.supports_imagegoal),
+            "tensorrt": getattr(navdp_navigator, "tensorrt_status", None),
         }
     )
 
@@ -431,6 +464,9 @@ def main() -> int:
     print(f"[INFO] NavDP server listening on 127.0.0.1:{args.port}")
     print(f"[INFO] Checkpoint        : {args.checkpoint}")
     print(f"[INFO] Device            : {args.device}")
+    print(f"[INFO] TensorRT mode    : {args.tensorrt_mode}")
+    print(f"[INFO] TensorRT engines : {args.tensorrt_engine_dir}")
+    print(f"[INFO] TensorRT precision: {args.tensorrt_precision}")
     print(f"[INFO] Save debug video  : {args.save_debug_video}")
     if args.debug_video_dir:
         print(f"[INFO] Debug video dir   : {args.debug_video_dir}")

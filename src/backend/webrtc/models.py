@@ -95,6 +95,9 @@ def build_frame_meta_message(frame: FrameCache) -> dict[str, object]:
             if not isinstance(item, dict):
                 continue
             compact: dict[str, object] = {}
+            class_id = item.get("class_id")
+            if isinstance(class_id, (int, float)) and not isinstance(class_id, bool):
+                compact["class_id"] = int(round(float(class_id)))
             for key in ("class_name", "track_id"):
                 value = item.get(key)
                 if isinstance(value, str) and value != "":
@@ -106,6 +109,17 @@ def build_frame_meta_message(frame: FrameCache) -> dict[str, object]:
                 value = item.get(key)
                 if isinstance(value, (int, float)):
                     compact[key] = float(value)
+            for key in ("memory_match_score",):
+                value = item.get(key)
+                if isinstance(value, (int, float)):
+                    compact[key] = float(value)
+            for key in ("memory_object_id", "memory_status", "memory_observation_id", "memory_filter_reason"):
+                value = item.get(key)
+                if isinstance(value, str) and value != "":
+                    compact[key] = value
+            memory_persisted = item.get("memory_persisted")
+            if isinstance(memory_persisted, bool):
+                compact["memory_persisted"] = memory_persisted
             world_pose = item.get("world_pose_xyz")
             if isinstance(world_pose, list) and len(world_pose) >= 3:
                 compact["world_pose_xyz"] = [float(world_pose[0]), float(world_pose[1]), float(world_pose[2])]

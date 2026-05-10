@@ -8,9 +8,10 @@ AURA system owns the backend and runtime services that sit behind the dashboard 
 
 - `control`
 - `inference`
+- `memory`
 - `navigation`
 - `perception`
-- `planner`
+- `reasoning`
 - `shared/contracts`
 - `transport`
 - `world_state`
@@ -31,8 +32,8 @@ Top-level runtime services live directly under `src`:
 ## Canonical launchers
 
 - `scripts/run_system/inference_system_windows.bat`
+- `scripts/run_system/reasoning_system_windows.bat`
 - `scripts/run_system/navigation_system_windows.bat`
-- `scripts/run_system/planner_system_windows.bat`
 - `scripts/run_system/control_runtime_windows.bat`
 - `scripts/run_system/backend_windows.ps1`
 - `scripts/run_system/runtime_windows.ps1` (optional standalone runtime surface)
@@ -40,12 +41,18 @@ Top-level runtime services live directly under `src`:
 
 ## Python entrypoints
 
-- `python -m systems.inference.api.serve_inference_system`
-- `python -m systems.navigation.api.serve_navigation_system`
-- `python -m systems.planner.api.serve_planner_system`
-- `python -m systems.control.api.play_g1_internvla_navdp`
-- `python -m backend.api.serve_backend`
-- `python -m runtime.api.serve_runtime` (optional standalone runtime surface)
+- System services use the repo-local `.venv\Scripts\python.exe` by default.
+- Isaac Sim services use `%ISAACSIM_PATH%\python.bat` through `control_runtime_windows.bat`.
+- Override the system interpreter with `AURA_PYTHON` or launcher `-Python` only when intentionally testing another environment.
+
+Entrypoints:
+
+- `.venv\Scripts\python.exe -m systems.inference.api.serve_inference_system`
+- `.venv\Scripts\python.exe -m systems.reasoning.api.serve_reasoning_system`
+- `.venv\Scripts\python.exe -m systems.navigation.api.serve_navigation_system`
+- `%ISAACSIM_PATH%\python.bat -m systems.control.api.play_g1_internvla_navdp`
+- `.venv\Scripts\python.exe -m backend.api.serve_backend`
+- `.venv\Scripts\python.exe -m runtime.api.serve_runtime` (optional standalone runtime surface)
 
 ## Default local bring-up
 
@@ -63,14 +70,24 @@ Use `runtime_windows.ps1` only when you explicitly want an external runtime cont
 - Backend: `18095`
 - Runtime: `18096`
 - Inference system: `15880`
-- Planner system: `17881`
+- Reasoning system: `17881`
 - Navigation system: `17882`
 - Control runtime: `8892`
 
 ## Install
 
-```bash
-python -m pip install -e .
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_system_venv_windows.ps1
+```
+
+The default setup includes the `webrtc` extra because the dashboard viewer
+uses the backend-owned WebRTC signaling path. Use `-NoWebRtc` only for a
+minimal non-viewer environment.
+
+For test tooling:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_system_venv_windows.ps1 -Extras dev
 ```
 
 ## Test

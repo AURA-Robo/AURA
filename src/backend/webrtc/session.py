@@ -10,7 +10,12 @@ import uuid
 from .config import WebRTCServiceConfig
 from .models import build_session_ready_message
 from .subscriber import ObservationSubscriber
-from .tracks import DepthPreviewVideoTrack, RgbVideoTrack
+from .tracks import (
+    DepthPreviewVideoTrack,
+    RgbVideoTrack,
+    video_dependencies_available,
+    video_dependency_error_message,
+)
 
 try:
     from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
@@ -44,6 +49,20 @@ def _require_rtc_dependencies() -> None:
             _RTC_IMPORT_ERROR = None
     if _RTC_IMPORT_ERROR is not None:
         raise RuntimeError("aiortc is required for WebRTC peer sessions.") from _RTC_IMPORT_ERROR
+
+
+def webrtc_dependency_error_message() -> str:
+    if _RTC_IMPORT_ERROR is not None:
+        return "aiortc is required for WebRTC peer sessions."
+    return video_dependency_error_message()
+
+
+def webrtc_dependencies_available() -> bool:
+    try:
+        _require_rtc_dependencies()
+    except RuntimeError:
+        return False
+    return video_dependencies_available()
 
 
 async def wait_for_ice_gathering_complete(peer_connection, *, timeout_sec: float = 10.0) -> None:  # noqa: ANN001
@@ -81,6 +100,11 @@ class WebRTCPeerSession:
             asyncio.create_task(self._state_snapshot_loop(), name=f"webrtc-state-snapshot-{self.session_id}"),
             asyncio.create_task(self._telemetry_loop(), name=f"webrtc-telemetry-{self.session_id}"),
         ]
+        self._debug_counters = {
+            "sendErrors": 0,
+            "stateSendErrors": 0,
+            "telemetrySendErrors": 0,
+        }
 
         @self._pc.on("datachannel")
         def _on_datachannel(channel) -> None:  # noqa: ANN001
@@ -118,6 +142,13 @@ class WebRTCPeerSession:
                 await task
         self._tasks = []
         await self._pc.close()
+
+    def debug_snapshot(self) -> dict[str, int]:
+        return {
+            "sendErrors": int(self._debug_counters.get("sendErrors", 0)),
+            "stateSendErrors": int(self._debug_counters.get("stateSendErrors", 0)),
+            "telemetrySendErrors": int(self._debug_counters.get("telemetrySendErrors", 0)),
+        }
 
     def _configure_data_channel(self, channel) -> None:  # noqa: ANN001
         label = str(getattr(channel, "label", "")).strip().lower()
@@ -190,9 +221,17 @@ class WebRTCPeerSession:
             return
         if str(getattr(channel, "readyState", "")).lower() != "open":
             return
+        channel_label = str(getattr(channel, "label", "")).strip().lower()
         try:
             channel.send(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
         except Exception:
+            self._debug_counters["sendErrors"] = int(self._debug_counters.get("sendErrors", 0)) + 1
+            state_label = str(getattr(getattr(self, "config", None), "channel_labels", ("state", "telemetry"))[0]).lower()
+            telemetry_label = str(getattr(getattr(self, "config", None), "channel_labels", ("state", "telemetry"))[1]).lower()
+            if channel_label == state_label:
+                self._debug_counters["stateSendErrors"] = int(self._debug_counters.get("stateSendErrors", 0)) + 1
+            elif channel_label == telemetry_label:
+                self._debug_counters["telemetrySendErrors"] = int(self._debug_counters.get("telemetrySendErrors", 0)) + 1
             return
 
     @staticmethod

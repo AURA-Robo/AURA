@@ -42,6 +42,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llama-server", default=os.environ.get("PLANNER_LLAMA_SERVER", str(_default_llama_exe())))
     parser.add_argument("--gpu-layers", type=int, default=int(os.environ.get("PLANNER_GPU_LAYERS", "999") or 999))
     parser.add_argument("--ctx-size", type=int, default=int(os.environ.get("PLANNER_CTX_SIZE", "1024") or 1024))
+    parser.add_argument(
+        "--parallel-slots",
+        type=int,
+        default=int(os.environ.get("PLANNER_PARALLEL_SLOTS", "2") or 2),
+    )
     parser.add_argument("--cache-type-k", default=os.environ.get("PLANNER_CACHE_TYPE_K", "q8_0"))
     parser.add_argument("--cache-type-v", default=os.environ.get("PLANNER_CACHE_TYPE_V", "q8_0"))
     return parser
@@ -49,6 +54,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def build_command(args: argparse.Namespace) -> list[str]:
     llama_server = Path(args.llama_server)
+    parallel_slots = max(1, int(args.parallel_slots))
+    total_ctx_size = max(1, int(args.ctx_size)) * parallel_slots
     command = [
         str(llama_server),
         "-m",
@@ -71,7 +78,9 @@ def build_command(args: argparse.Namespace) -> list[str]:
             "-ngl",
             str(int(args.gpu_layers)),
             "-c",
-            str(int(args.ctx_size)),
+            str(total_ctx_size),
+            "--parallel",
+            str(parallel_slots),
             "-ctk",
             str(args.cache_type_k),
             "-ctv",

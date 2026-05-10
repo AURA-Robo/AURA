@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import threading
 
 import numpy as np
 
+from systems.shared.contracts.navigation import RobotState2D
+
 from .geometry import point_goal_body_from_world, point_goal_world_from_frame
-
-
-@dataclass(slots=True)
-class RobotState2D:
-    """Minimal 2D robot state used by the goal provider and follower."""
-
-    base_pos_w: np.ndarray
-    base_yaw: float
-    lin_vel_b: np.ndarray
-    yaw_rate: float
 
 
 class PointGoalProvider:

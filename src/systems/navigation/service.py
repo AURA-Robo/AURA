@@ -44,12 +44,42 @@ DIRECT_ACTION_MODES = frozenset(("forward", "yaw_left", "yaw_right"))
 
 
 @dataclass(slots=True)
+class MemoryNavigationTarget:
+    object_id: str
+    class_name: str
+    scene_scope: str | None
+    world_pose_xyz: np.ndarray
+    pose_age_sec: float
+    stop_radius_m: float
+    reacquire_radius_m: float
+    reacquire_timeout_sec: float
+
+
+@dataclass(slots=True)
+class ReturnPoseTarget:
+    world_xy: np.ndarray
+    yaw_rad: float | None
+
+
+@dataclass(slots=True)
+class CompactDetection:
+    class_name: str
+    track_id: str | None
+    bbox_xyxy: tuple[float, float, float, float] | None
+    confidence: float
+    world_pose_xyz: np.ndarray | None
+
+
+@dataclass(slots=True)
 class NavigationCommand:
     instruction: str
     language: str
     task_id: str | None
     session_id: str
     started_at: float
+    mode: str = "instruction"
+    memory_target: MemoryNavigationTarget | None = None
+    return_target: ReturnPoseTarget | None = None
 
 
 @dataclass(slots=True)
@@ -62,6 +92,7 @@ class NavigationObservation:
     camera_pos_w: np.ndarray
     camera_rot_w: np.ndarray
     robot_state: RobotState2D
+    detections: list[CompactDetection]
 
 
 def _python_command() -> str:
@@ -88,6 +119,63 @@ def _direct_action_sequence(result) -> tuple[str, ...]:
     if decision_mode in DIRECT_ACTION_MODES:
         return (decision_mode,)
     return ()
+
+
+def _normalize_scene_scope(value: object) -> str | None:
+    normalized = " ".join(str(value or "").strip().split())
+    return normalized or None
+
+
+def _decode_memory_target(payload: object) -> MemoryNavigationTarget:
+    if not isinstance(payload, dict):
+        raise ValueError("target must be a JSON object")
+    object_id = str(payload.get("object_id") or "").strip()
+    class_name = str(payload.get("class_name") or "").strip()
+    world_pose_xyz = payload.get("world_pose_xyz")
+    if not object_id:
+        raise ValueError("target.object_id must be a non-empty string")
+    if not class_name:
+        raise ValueError("target.class_name must be a non-empty string")
+    if not isinstance(world_pose_xyz, (list, tuple)) or len(world_pose_xyz) < 3:
+        raise ValueError("target.world_pose_xyz must be a 3-element array")
+    try:
+        xyz = np.asarray(
+            (float(world_pose_xyz[0]), float(world_pose_xyz[1]), float(world_pose_xyz[2])),
+            dtype=np.float32,
+        ).reshape(3)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target.world_pose_xyz must contain numeric values") from exc
+    return MemoryNavigationTarget(
+        object_id=object_id,
+        class_name=class_name,
+        scene_scope=_normalize_scene_scope(payload.get("scene_scope")),
+        world_pose_xyz=xyz,
+        pose_age_sec=max(0.0, float(payload.get("pose_age_sec", 0.0) or 0.0)),
+        stop_radius_m=max(0.05, float(payload.get("stop_radius_m", 0.8) or 0.8)),
+        reacquire_radius_m=max(0.05, float(payload.get("reacquire_radius_m", 1.0) or 1.0)),
+        reacquire_timeout_sec=max(0.1, float(payload.get("reacquire_timeout_sec", 4.0) or 4.0)),
+    )
+
+
+def _decode_return_pose_target(payload: object) -> ReturnPoseTarget:
+    if not isinstance(payload, dict):
+        raise ValueError("target must be a JSON object")
+    world_xy = payload.get("world_xy")
+    if not isinstance(world_xy, (list, tuple)) or len(world_xy) < 2:
+        raise ValueError("target.world_xy must be a 2-element array")
+    try:
+        xy = np.asarray((float(world_xy[0]), float(world_xy[1])), dtype=np.float32).reshape(2)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target.world_xy must contain numeric values") from exc
+    yaw_rad = payload.get("yaw_rad")
+    if yaw_rad is not None:
+        try:
+            yaw_value = float(yaw_rad)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target.yaw_rad must be numeric when provided") from exc
+    else:
+        yaw_value = None
+    return ReturnPoseTarget(world_xy=xy, yaw_rad=yaw_value)
 
 
 class NavigationSystem:
@@ -120,6 +208,10 @@ class NavigationSystem:
         self._last_system2_pixel_goal: list[int] | None = None
         self._active_target_summary: dict[str, object] | None = None
         self._action_override_mode: str | None = None
+        self._latest_detections: list[CompactDetection] = []
+        self._memory_reacquire_state: str | None = None
+        self._memory_reacquire_started_at: float | None = None
+        self._memory_reacquire_sweep_sent = False
         self._stop_event = threading.Event()
         self._system2_event = threading.Event()
         self._system1_event = threading.Event()
@@ -183,6 +275,12 @@ class NavigationSystem:
                     str(args.navdp_checkpoint),
                     "--device",
                     str(args.navdp_device),
+                    "--tensorrt-mode",
+                    str(getattr(args, "navdp_tensorrt_mode", "off") or "off"),
+                    "--tensorrt-engine-dir",
+                    str(getattr(args, "navdp_tensorrt_engine_dir", "") or ""),
+                    "--tensorrt-precision",
+                    str(getattr(args, "navdp_tensorrt_precision", "fp16") or "fp16"),
                 ],
                 required=False,
             ),
@@ -246,6 +344,10 @@ class NavigationSystem:
         self._last_system2_pixel_goal = None
         self._active_target_summary = None
         self._action_override_mode = None
+        self._latest_detections = []
+        self._memory_reacquire_state = None
+        self._memory_reacquire_started_at = None
+        self._memory_reacquire_sweep_sent = False
 
     def command(self, instruction: str, language: str, *, task_id: str | None) -> dict[str, object]:
         normalized_instruction = " ".join(str(instruction).strip().split())
@@ -258,11 +360,91 @@ class NavigationSystem:
                 task_id=task_id,
                 session_id=f"nav-{time.time_ns()}",
                 started_at=time.time(),
+                mode="instruction",
             )
             self._clear_runtime_state_locked()
             has_observation = self._latest_observation is not None
         if has_observation:
             self._system2_event.set()
+        return self.status_payload()
+
+    def command_memory_target(self, target: MemoryNavigationTarget, *, task_id: str | None) -> dict[str, object]:
+        with self._lock:
+            self._command = NavigationCommand(
+                instruction=f"go to remembered {target.class_name}",
+                language="en",
+                task_id=task_id,
+                session_id=f"nav-{time.time_ns()}",
+                started_at=time.time(),
+                mode="memory_pose",
+                memory_target=target,
+            )
+            self._clear_runtime_state_locked()
+            self._last_system2 = {
+                "status": "memory_pose",
+                "decision_mode": "memory_pose",
+                "text": f"Approach remembered {target.class_name}",
+                "latency_ms": None,
+                "action_sequence": [],
+            }
+            self._system2_stage = self._make_stage_payload("system2", status="healthy", detail="memory pose mode")
+            self._memory_reacquire_state = "approach_memory_pose"
+            self._set_goal_locked(
+                np.asarray(target.world_pose_xyz[:2], dtype=np.float32),
+                None,
+                {
+                    "className": target.class_name.replace("_", " "),
+                    "source": "object_memory",
+                    "object_id": target.object_id,
+                    "scene_scope": target.scene_scope,
+                    "pose_age_sec": float(target.pose_age_sec),
+                    "world_pose_xyz": target.world_pose_xyz.astype(float).tolist(),
+                },
+            )
+            has_observation = self._latest_observation is not None
+        if has_observation:
+            self._system1_event.set()
+        return self.status_payload()
+
+    def command_return_pose(self, target: ReturnPoseTarget, *, task_id: str | None) -> dict[str, object]:
+        observation = None
+        with self._lock:
+            self._command = NavigationCommand(
+                instruction="return to origin",
+                language="en",
+                task_id=task_id,
+                session_id=f"nav-{time.time_ns()}",
+                started_at=time.time(),
+                mode="return_pose",
+                return_target=target,
+            )
+            self._clear_runtime_state_locked()
+            self._last_system2 = {
+                "status": "return_pose",
+                "decision_mode": "return_pose",
+                "text": "Returning to origin",
+                "latency_ms": None,
+                "action_sequence": [],
+            }
+            self._system2_stage = self._make_stage_payload("system2", status="healthy", detail="return pose mode")
+            self._set_goal_locked(
+                np.asarray(target.world_xy, dtype=np.float32),
+                None,
+                {
+                    "className": "Start Pose",
+                    "source": "return_pose",
+                    "world_pose_xyz": [float(target.world_xy[0]), float(target.world_xy[1]), 0.0],
+                    "yaw_rad": None if target.yaw_rad is None else float(target.yaw_rad),
+                },
+            )
+            has_observation = self._latest_observation is not None
+            observation = self._latest_observation
+        if observation is not None:
+            self._advance_return_navigation(observation)
+        with self._lock:
+            has_active_goal = self._last_goal_world_xy is not None
+        if has_observation and has_active_goal:
+            self._system1_event.set()
         return self.status_payload()
 
     def cancel(self) -> dict[str, object]:
@@ -275,7 +457,15 @@ class NavigationSystem:
         observation = self._decode_observation(payload)
         with self._lock:
             self._latest_observation = observation
+            self._latest_detections = list(observation.detections)
             self._capture_generation += 1
+            command = self._command
+            command_mode = None if command is None else command.mode
+        if command_mode == "memory_pose":
+            self._advance_memory_navigation(observation)
+        elif command_mode == "return_pose":
+            self._advance_return_navigation(observation)
+        with self._lock:
             command_active = self._command is not None
             has_goal = self._last_goal_world_xy is not None
             action_override_mode = self._action_override_mode
@@ -313,6 +503,7 @@ class NavigationSystem:
             camera_pos_w=camera_pos_w,
             camera_rot_w=camera_rot_w,
             robot_state=robot_state,
+            detections=self._decode_detections(payload.get("detections")),
         )
 
     def _decode_array(self, payload: dict[str, object], *, ref_key: str, legacy_key: str) -> np.ndarray:
@@ -326,6 +517,49 @@ class NavigationSystem:
         if legacy_key == "rgb_jpeg_base64":
             return decode_rgb_jpeg_base64(legacy_payload)
         return decode_depth_png_base64(legacy_payload)
+
+    def _decode_detections(self, payload: object) -> list[CompactDetection]:
+        if not isinstance(payload, list):
+            return []
+        detections: list[CompactDetection] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            class_name = str(item.get("class_name") or "").strip()
+            if not class_name:
+                continue
+            bbox_xyxy = item.get("bbox_xyxy")
+            normalized_bbox = None
+            if isinstance(bbox_xyxy, (list, tuple)) and len(bbox_xyxy) >= 4:
+                try:
+                    normalized_bbox = (
+                        float(bbox_xyxy[0]),
+                        float(bbox_xyxy[1]),
+                        float(bbox_xyxy[2]),
+                        float(bbox_xyxy[3]),
+                    )
+                except (TypeError, ValueError):
+                    normalized_bbox = None
+            world_pose_xyz = None
+            raw_pose = item.get("world_pose_xyz")
+            if isinstance(raw_pose, (list, tuple)) and len(raw_pose) >= 3:
+                try:
+                    world_pose_xyz = np.asarray(
+                        (float(raw_pose[0]), float(raw_pose[1]), float(raw_pose[2])),
+                        dtype=np.float32,
+                    ).reshape(3)
+                except (TypeError, ValueError):
+                    world_pose_xyz = None
+            detections.append(
+                CompactDetection(
+                    class_name=class_name,
+                    track_id=str(item.get("track_id") or "").strip() or None,
+                    bbox_xyxy=normalized_bbox,
+                    confidence=float(item.get("confidence", 0.0) or 0.0),
+                    world_pose_xyz=world_pose_xyz,
+                )
+            )
+        return detections
 
     def _ring_for_name(self, name: str) -> SharedMemoryRing:
         ring = self._shm_rings.get(name)
@@ -352,6 +586,13 @@ class NavigationSystem:
                     needs_reset = self._session_reset_required
                     if command is None or observation is None:
                         self._system2_stage = self._make_stage_payload("system2", status="idle")
+                        break
+                    if command.mode in {"memory_pose", "return_pose"}:
+                        self._system2_stage = self._make_stage_payload(
+                            "system2",
+                            status="healthy",
+                            detail="memory pose mode" if command.mode == "memory_pose" else "return pose mode",
+                        )
                         break
                     if capture_generation == self._system2_applied_capture_generation and not needs_reset:
                         break
@@ -588,6 +829,138 @@ class NavigationSystem:
             self._goal_generation += 1
         return changed
 
+    def _advance_memory_navigation(self, observation: NavigationObservation) -> None:
+        with self._lock:
+            command = self._command
+            if command is None or command.mode != "memory_pose" or command.memory_target is None:
+                return
+            target = command.memory_target
+            robot_xy = np.asarray(observation.robot_state.base_pos_w, dtype=np.float32)[:2]
+            target_xy = np.asarray(target.world_pose_xyz[:2], dtype=np.float32)
+            distance_m = float(np.linalg.norm(robot_xy - target_xy))
+            reacquire_started_at = self._memory_reacquire_started_at
+            detections = list(self._latest_detections)
+
+            if reacquire_started_at is None:
+                self._memory_reacquire_state = "approach_memory_pose"
+                if distance_m > float(target.stop_radius_m):
+                    return
+                self._memory_reacquire_state = "reacquire_pending"
+                self._memory_reacquire_started_at = time.monotonic()
+                reacquire_started_at = self._memory_reacquire_started_at
+                self._trajectory_world_xy = np.zeros((0, 2), dtype=np.float32)
+                self._trajectory_stamp_s = float(observation.stamp_s)
+                self._system1_stage = self._make_stage_payload("navdp", status="paused", detail="reacquiring target")
+                self._action_override_mode = "reacquire"
+                if not self._memory_reacquire_sweep_sent:
+                    self._last_system2 = {
+                        "status": "reacquire_pending",
+                        "decision_mode": "yaw_left",
+                        "text": "memory target reacquire sweep",
+                        "latency_ms": None,
+                        "action_sequence": ["yaw_left", "yaw_right", "yaw_left"],
+                    }
+                    self._memory_reacquire_sweep_sent = True
+                else:
+                    self._last_system2 = {
+                        "status": "reacquire_pending",
+                        "decision_mode": "memory_pose",
+                        "text": "waiting for memory target reacquire",
+                        "latency_ms": None,
+                        "action_sequence": [],
+                    }
+
+            matched = self._match_reacquired_detection(target, detections)
+            if matched is not None:
+                self._memory_reacquire_state = "reacquired"
+                self._action_override_mode = None
+                self._last_error = None
+                self._trajectory_world_xy = np.zeros((0, 2), dtype=np.float32)
+                self._trajectory_stamp_s = float(observation.stamp_s)
+                self._system1_stage = self._make_stage_payload("navdp", status="idle", detail="memory target reacquired")
+                self._last_system2 = {
+                    "status": "reacquired",
+                    "decision_mode": "stop",
+                    "text": "memory target reacquired",
+                    "latency_ms": None,
+                    "action_sequence": [],
+                }
+                return
+
+            elapsed = max(0.0, time.monotonic() - reacquire_started_at)
+            self._memory_reacquire_state = "reacquire_pending"
+            self._last_system2 = {
+                "status": "reacquire_pending",
+                "decision_mode": "memory_pose",
+                "text": "waiting for memory target reacquire",
+                "latency_ms": None,
+                "action_sequence": [],
+            }
+            if elapsed < float(target.reacquire_timeout_sec):
+                return
+
+            self._memory_reacquire_state = "failed"
+            self._action_override_mode = None
+            self._last_error = "memory_target_not_reacquired"
+            self._trajectory_world_xy = np.zeros((0, 2), dtype=np.float32)
+            self._trajectory_stamp_s = float(observation.stamp_s)
+            self._system1_stage = self._make_stage_payload("navdp", status="error", detail=self._last_error)
+            self._last_system2 = {
+                "status": "reacquire_failed",
+                "decision_mode": "stop",
+                "text": self._last_error,
+                "latency_ms": None,
+                "action_sequence": [],
+            }
+
+    def _advance_return_navigation(self, observation: NavigationObservation) -> None:
+        with self._lock:
+            command = self._command
+            if command is None or command.mode != "return_pose" or command.return_target is None:
+                return
+            robot_xy = np.asarray(observation.robot_state.base_pos_w, dtype=np.float32)[:2]
+            target_xy = np.asarray(command.return_target.world_xy, dtype=np.float32).reshape(2)
+            tolerance_m = max(0.05, float(getattr(self.args, "memory_approach_radius_m", 0.8)))
+            distance_m = float(np.linalg.norm(robot_xy - target_xy))
+            if distance_m > tolerance_m:
+                return
+            self._action_override_mode = None
+            self._last_error = None
+            self._trajectory_world_xy = np.zeros((0, 2), dtype=np.float32)
+            self._trajectory_stamp_s = float(observation.stamp_s)
+            self._set_goal_locked(None, None, None)
+            self._system1_stage = self._make_stage_payload("navdp", status="idle", detail="return pose reached")
+            self._last_system2 = {
+                "status": "stop",
+                "decision_mode": "stop",
+                "text": "return pose reached",
+                "latency_ms": None,
+                "action_sequence": [],
+            }
+
+    @staticmethod
+    def _match_reacquired_detection(
+        target: MemoryNavigationTarget,
+        detections: list[CompactDetection],
+    ) -> CompactDetection | None:
+        best: tuple[float, CompactDetection] | None = None
+        for detection in detections:
+            if detection.world_pose_xyz is None:
+                continue
+            if detection.class_name != target.class_name:
+                continue
+            distance = float(
+                np.linalg.norm(
+                    np.asarray(detection.world_pose_xyz, dtype=np.float32).reshape(3)
+                    - np.asarray(target.world_pose_xyz, dtype=np.float32).reshape(3)
+                )
+            )
+            if distance > float(target.reacquire_radius_m):
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, detection)
+        return None if best is None else best[1]
+
     def status_payload(self) -> dict[str, object]:
         with self._lock:
             command = self._command
@@ -603,8 +976,28 @@ class NavigationSystem:
             capture_generation = int(self._capture_generation)
             goal_generation = int(self._goal_generation)
             action_override_mode = self._action_override_mode
+            memory_reacquire_state = self._memory_reacquire_state
+            memory_target = None if command is None else command.memory_target
+            return_target = None if command is None else command.return_target
+            observation = self._latest_observation
         now = time.monotonic()
         plan_age_s = None if trajectory_stamp_s <= 0.0 else max(0.0, now - trajectory_stamp_s)
+        memory_aware_task_active = command is not None and command.mode == "memory_pose"
+        resolved_memory_object_id = None if memory_target is None else memory_target.object_id
+        resolved_memory_pose_age_sec = None if memory_target is None else float(memory_target.pose_age_sec)
+        current_robot_pose = None
+        if observation is not None:
+            robot_state = observation.robot_state
+            base_pos_w = np.asarray(robot_state.base_pos_w, dtype=np.float32).reshape(-1)
+            current_robot_pose = {
+                "world_xyz": [
+                    float(base_pos_w[0]),
+                    float(base_pos_w[1]),
+                    float(base_pos_w[2] if base_pos_w.shape[0] >= 3 else 0.0),
+                ],
+                "world_xy": [float(base_pos_w[0]), float(base_pos_w[1])],
+                "yaw_rad": float(robot_state.base_yaw),
+            }
         return {
             "ok": True,
             "service": "navigation_system",
@@ -628,6 +1021,15 @@ class NavigationSystem:
             "system2PixelGoal": None if system2_pixel_goal is None else list(system2_pixel_goal),
             "active_target": active_target,
             "activeTarget": None if active_target is None else dict(active_target),
+            "memoryAwareTaskActive": bool(memory_aware_task_active),
+            "memoryNavigationMode": None if not memory_aware_task_active else "memory_pose",
+            "resolvedMemoryObjectId": resolved_memory_object_id,
+            "resolvedMemoryPoseAgeSec": resolved_memory_pose_age_sec,
+            "reacquireState": memory_reacquire_state,
+            "reacquire_state": memory_reacquire_state,
+            "current_robot_pose": current_robot_pose,
+            "currentRobotPose": None if current_robot_pose is None else dict(current_robot_pose),
+            "returnTargetWorldXy": None if return_target is None else [float(return_target.world_xy[0]), float(return_target.world_xy[1])],
         }
 
     def trajectory_payload(self) -> dict[str, object]:
@@ -718,15 +1120,24 @@ class NavigationSystemServer:
                     return
                 try:
                     if path == "/navigation/command":
+                        mode = str(payload.get("mode") or "instruction").strip() or "instruction"
+                        task_id = payload.get("task_id")
+                        if task_id is not None and not isinstance(task_id, str):
+                            raise ValueError("task_id must be a string")
+                        if mode == "memory_pose":
+                            target = _decode_memory_target(payload.get("target"))
+                            self._send_json(HTTPStatus.OK, service.command_memory_target(target, task_id=task_id))
+                            return
+                        if mode == "return_pose":
+                            target = _decode_return_pose_target(payload.get("target"))
+                            self._send_json(HTTPStatus.OK, service.command_return_pose(target, task_id=task_id))
+                            return
                         instruction = payload.get("instruction")
                         language = payload.get("language", "en")
-                        task_id = payload.get("task_id")
                         if not isinstance(instruction, str) or not instruction.strip():
                             raise ValueError("instruction must be a non-empty string")
                         if not isinstance(language, str):
                             raise ValueError("language must be a string")
-                        if task_id is not None and not isinstance(task_id, str):
-                            raise ValueError("task_id must be a string")
                         self._send_json(HTTPStatus.OK, service.command(instruction, language, task_id=task_id))
                         return
                     if path == "/navigation/cancel":
@@ -770,12 +1181,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--goal-depth-window", type=int, default=5)
     parser.add_argument("--goal-depth-min", type=float, default=0.25)
     parser.add_argument("--goal-depth-max", type=float, default=6.0)
+    parser.add_argument(
+        "--memory-approach-radius-m",
+        type=float,
+        default=float(os.environ.get("AURA_MEMORY_APPROACH_RADIUS_M", "0.8")),
+    )
+    parser.add_argument(
+        "--memory-reacquire-radius-m",
+        type=float,
+        default=float(os.environ.get("AURA_MEMORY_REACQUIRE_RADIUS_M", "1.0")),
+    )
+    parser.add_argument(
+        "--memory-reacquire-timeout-sec",
+        type=float,
+        default=float(os.environ.get("AURA_MEMORY_REACQUIRE_TIMEOUT_SEC", "4.0")),
+    )
     parser.add_argument("--backend-autostart", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backend-log-dir", default=str(_default_backend_log_dir()))
     parser.add_argument("--navdp-host", default=os.environ.get("NAVDP_HOST", "127.0.0.1"))
     parser.add_argument("--navdp-port", type=int, default=int(os.environ.get("NAVDP_PORT", "18888")))
-    parser.add_argument("--navdp-checkpoint", default=str(os.environ.get("NAVDP_CHECKPOINT", REPO_ROOT / "navdp-cross-modal.ckpt")))
+    parser.add_argument("--navdp-checkpoint", default=str(os.environ.get("NAVDP_CHECKPOINT", REPO_ROOT / "artifacts" / "models" / "navdp-cross-modal.ckpt")))
     parser.add_argument("--navdp-device", default=os.environ.get("NAVDP_DEVICE", "cuda:0"))
+    parser.add_argument("--navdp-tensorrt-mode", choices=("off", "auto", "required", "build"), default=os.environ.get("NAVDP_TENSORRT_MODE", "off"))
+    parser.add_argument("--navdp-tensorrt-engine-dir", default=os.environ.get("NAVDP_TENSORRT_ENGINE_DIR", str(REPO_ROOT / "artifacts" / "models" / "navdp_tensorrt")))
+    parser.add_argument("--navdp-tensorrt-precision", choices=("fp16", "fp32"), default=os.environ.get("NAVDP_TENSORRT_PRECISION", "fp16"))
     parser.add_argument("--system2-host", default=os.environ.get("SYSTEM2_HOST", "127.0.0.1"))
     parser.add_argument("--system2-port", type=int, default=int(os.environ.get("SYSTEM2_PORT", "15801")))
     parser.add_argument("--system2-llama-url", default=os.environ.get("SYSTEM2_LLAMA_URL", "http://127.0.0.1:15802"))

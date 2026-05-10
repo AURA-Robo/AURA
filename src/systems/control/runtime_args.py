@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import os
+
+from systems.shared.contracts.service_endpoints import CONTROL_RUNTIME_ENDPOINT, NAVIGATION_SYSTEM_ENDPOINT
 
 DEFAULT_PHYSICS_DT = 1.0 / 200.0
 DEFAULT_DECIMATION = 4
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 BOOTSTRAP_PARSER = argparse.ArgumentParser(add_help=False)
 BOOTSTRAP_PARSER.add_argument("--headless", action="store_true", help="Run Isaac Sim without a GUI window.")
 BOOTSTRAP_ARGS, _ = BOOTSTRAP_PARSER.parse_known_args()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in _TRUE_VALUES
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -179,7 +190,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--navigation_url",
         type=str,
-        default="http://127.0.0.1:17882",
+        default=NAVIGATION_SYSTEM_ENDPOINT.base_url(),
         help="Base URL of the standalone navigation system.",
     )
     parser.add_argument(
@@ -203,13 +214,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runtime_control_api_host",
         type=str,
-        default="127.0.0.1",
+        default=CONTROL_RUNTIME_ENDPOINT.host,
         help="Bind address for the runtime control HTTP API in internvla_navdp mode.",
     )
     parser.add_argument(
         "--runtime_control_api_port",
         type=int,
-        default=8892,
+        default=CONTROL_RUNTIME_ENDPOINT.port,
         help="Port for the runtime control HTTP API. Set to 0 to disable it.",
     )
     parser.add_argument(
@@ -305,6 +316,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable Isaac POV frame publication onto the dashboard viewer transport.",
     )
     parser.set_defaults(viewer_publish=True)
+    detection_group = parser.add_mutually_exclusive_group()
+    detection_group.add_argument(
+        "--detection-enabled",
+        dest="detection_enabled",
+        action="store_true",
+        help="Enable the in-process detector producer for viewer overlays and navigation updates.",
+    )
+    detection_group.add_argument(
+        "--no-detection-enabled",
+        dest="detection_enabled",
+        action="store_false",
+        help="Disable the in-process detector producer.",
+    )
+    parser.set_defaults(detection_enabled=_env_flag("AURA_DETECTION_ENABLED", True))
+    parser.add_argument(
+        "--detection-model-path",
+        type=str,
+        default=os.environ.get("AURA_DETECTION_MODEL_PATH", ""),
+        help="Path to a YOLO-family detection model file used by the in-process detector runtime.",
+    )
     parser.add_argument(
         "--lookahead_distance",
         type=float,
@@ -334,5 +365,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="First-order smoothing constant for NavDP follower output in seconds.",
+    )
+    parser.add_argument(
+        "--planner_base_url",
+        type=str,
+        default=os.environ.get("PLANNER_MODEL_BASE_URL", ""),
+        help="Optional planner completion endpoint used for task-frame generation.",
+    )
+    parser.add_argument(
+        "--planner_model",
+        type=str,
+        default=os.environ.get("PLANNER_MODEL_NAME", "Qwen3-1.7B-Q4_K_M-Instruct.gguf"),
+        help="Planner model label reported to the tasking adapter.",
+    )
+    parser.add_argument(
+        "--planner_timeout",
+        type=float,
+        default=float(os.environ.get("PLANNER_TIMEOUT", "120.0")),
+        help="Planner completion timeout in seconds.",
+    )
+    parser.add_argument(
+        "--planner_task_frame_slot_id",
+        type=int,
+        default=int(os.environ.get("PLANNER_TASK_FRAME_SLOT_ID", "1")),
+        help="Fixed llama.cpp slot used for task-frame planning requests.",
+    )
+    parser.add_argument(
+        "--knowledge_dsn",
+        type=str,
+        default=os.environ.get("AURA_KNOWLEDGE_DSN", os.environ.get("AURA_OBJECT_MEMORY_DSN", "")),
+        help="Optional Postgres DSN for document knowledge. Falls back to AURA_OBJECT_MEMORY_DSN.",
+    )
+    parser.add_argument(
+        "--knowledge_scene_scope",
+        type=str,
+        default=os.environ.get("AURA_SCENE_PRESET", ""),
+        help="Optional scene scope used when applying knowledge rules during runtime execution.",
     )
     return parser

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 
-from systems.navigation.api.runtime import FollowerState, NavDpPlan, RobotState2D, make_follower_state, point_goal_body_from_world
 from systems.shared.contracts.inference import System2Result
+from systems.shared.contracts.navigation import FollowerState, NavDpPlan, RobotState2D, make_follower_state
 
 
 def _zero_command() -> np.ndarray:
@@ -16,6 +17,16 @@ def _zero_command() -> np.ndarray:
 
 def _empty_world_path() -> np.ndarray:
     return np.zeros((0, 2), dtype=np.float32)
+
+
+def _point_goal_body_from_world(goal_world_xy: np.ndarray, base_pos_w: np.ndarray, base_yaw: float) -> np.ndarray:
+    goal_xy = np.asarray(goal_world_xy, dtype=np.float64).reshape(2)
+    base_xy = np.asarray(base_pos_w, dtype=np.float64).reshape(3)[:2]
+    delta_world = goal_xy - base_xy
+    cos_yaw = math.cos(base_yaw)
+    sin_yaw = math.sin(base_yaw)
+    rot_bw = np.asarray(((cos_yaw, sin_yaw), (-sin_yaw, cos_yaw)), dtype=np.float64)
+    return (rot_bw @ delta_world).astype(np.float32)
 
 
 @dataclass(slots=True)
@@ -208,4 +219,4 @@ def goal_is_done(goal_state: GoalState, robot_state: RobotState2D) -> bool:
 def goal_current_body_xy(goal_state: GoalState, robot_state: RobotState2D) -> np.ndarray:
     if goal_target_mode(goal_state) != "point" or goal_state.target_world_xy is None:
         raise RuntimeError("GoalState does not have an active goal.")
-    return point_goal_body_from_world(goal_state.target_world_xy, robot_state.base_pos_w, robot_state.base_yaw)
+    return _point_goal_body_from_world(goal_state.target_world_xy, robot_state.base_pos_w, robot_state.base_yaw)

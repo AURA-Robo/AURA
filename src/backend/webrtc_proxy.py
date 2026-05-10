@@ -31,10 +31,24 @@ async def get_config(app: web.Application) -> dict[str, Any]:
 async def proxy_offer(app: web.Application, payload: dict[str, Any]) -> web.Response:
     base = str(app[WEBRTC_PROXY_BASE] or "").rstrip("/")
     if not base:
-        if app[WEBRTC_SERVICE] is None:
+        service = app[WEBRTC_SERVICE]
+        if service is None:
             return web.json_response({"error": "webrtc_proxy_unavailable"}, status=503)
+        if hasattr(service, "dependencies_available") and not service.dependencies_available():
+            message = (
+                service.dependency_error_message()
+                if hasattr(service, "dependency_error_message")
+                else "WebRTC dependencies are unavailable."
+            )
+            return web.json_response(
+                {
+                    "error": "webrtc_dependency_missing",
+                    "message": message,
+                },
+                status=503,
+            )
         try:
-            response = await app[WEBRTC_SERVICE].accept_offer(payload)
+            response = await service.accept_offer(payload)
         except RuntimeError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         return web.json_response(response)

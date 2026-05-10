@@ -81,6 +81,34 @@ class NavigationSystemClient:
             payload["task_id"] = str(task_id)
         return self._request("POST", "/navigation/command", json_payload=payload)
 
+    def command_memory_target(
+        self,
+        target: dict[str, object],
+        *,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, object] = {
+            "mode": "memory_pose",
+            "target": dict(target),
+        }
+        if task_id:
+            payload["task_id"] = str(task_id)
+        return self._request("POST", "/navigation/command", json_payload=payload)
+
+    def command_return_pose(
+        self,
+        origin_pose: dict[str, object],
+        *,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, object] = {
+            "mode": "return_pose",
+            "target": dict(origin_pose),
+        }
+        if task_id:
+            payload["task_id"] = str(task_id)
+        return self._request("POST", "/navigation/command", json_payload=payload)
+
     def cancel(self) -> dict[str, Any]:
         return self._request("POST", "/navigation/cancel", json_payload={})
 
@@ -103,6 +131,7 @@ class NavigationSystemClient:
         lin_vel_b: np.ndarray,
         yaw_rate: float,
         stamp_s: float,
+        detections: list[dict[str, object]] | None = None,
         system2_rgb_history: np.ndarray | None = None,
         navdp_rgb_history: np.ndarray | None = None,
     ) -> dict[str, Any]:
@@ -125,6 +154,8 @@ class NavigationSystemClient:
             },
             "stamp_s": float(stamp_s),
         }
+        if detections is not None:
+            payload["detections"] = list(detections)
         return self._request("POST", "/navigation/update", json_payload=payload)
 
 

@@ -116,26 +116,37 @@ def _args() -> Namespace:
         navigation_shm_name="aura_test_nav_shm",
         navigation_shm_slot_size=8 * 1024 * 1024,
         navigation_shm_capacity=8,
+        memory_approach_radius_m=0.8,
+        memory_reacquire_radius_m=1.0,
+        memory_reacquire_timeout_sec=4.0,
     )
 
 
-def _update_payload(frame_id: int) -> dict[str, object]:
+def _update_payload(
+    frame_id: int,
+    *,
+    base_pos_w: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    detections: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     rgb = np.full((3, 4, 3), frame_id, dtype=np.uint8)
     depth = np.full((3, 4), 1.5, dtype=np.float32)
-    return {
+    payload = {
         "rgb_jpeg_base64": encode_rgb_jpeg_base64(rgb),
         "depth_png_base64": encode_depth_png_base64(depth),
         "intrinsic": np.eye(3, dtype=np.float32).tolist(),
         "camera_pos_w": np.asarray((0.0, 0.0, 1.0), dtype=np.float32).tolist(),
         "camera_rot_w": np.eye(3, dtype=np.float32).tolist(),
         "robot_state": {
-            "base_pos_w": np.asarray((0.0, 0.0, 0.0), dtype=np.float32).tolist(),
+            "base_pos_w": np.asarray(base_pos_w, dtype=np.float32).tolist(),
             "base_yaw": 0.0,
             "lin_vel_b": np.asarray((0.0, 0.0), dtype=np.float32).tolist(),
             "yaw_rate": 0.0,
         },
         "stamp_s": float(frame_id),
     }
+    if detections is not None:
+        payload["detections"] = list(detections)
+    return payload
 
 
 def _wait_until(predicate, timeout_s: float = 1.0) -> bool:
@@ -285,5 +296,163 @@ def test_navigation_service_generates_local_trajectory_for_go_to_purple_box(monk
         assert trajectory_payload["goal_world_xy"] == [1.0, 2.0]
         assert trajectory_payload["trajectory_world_xy"] == [[1.0, 2.0], [2.0, 3.0]]
         assert trajectory_payload["path_points"] == 2
+    finally:
+        system.shutdown()
+
+
+def test_navigation_service_memory_pose_bypasses_system2_and_sets_direct_goal(monkeypatch) -> None:
+    monkeypatch.setattr(navigation_service, "InternVlaNavClient", _GoalSystem2Client)
+    monkeypatch.setattr(navigation_service, "NavDpClient", _NavDpClient)
+    monkeypatch.setattr(
+        navigation_service,
+        "camera_plan_to_world_xy",
+        lambda trajectory_camera, camera_pos_w, camera_rot_w: np.asarray([[2.0, 3.0], [2.2, 3.0]], dtype=np.float32),
+    )
+
+    system = navigation_service.NavigationSystem(_args())
+    try:
+        command_payload = system.command_memory_target(
+            navigation_service.MemoryNavigationTarget(
+                object_id="obj-chair-1",
+                class_name="chair",
+                scene_scope="warehouse",
+                world_pose_xyz=np.asarray((2.0, 3.0, 0.0), dtype=np.float32),
+                pose_age_sec=5.0,
+                stop_radius_m=0.8,
+                reacquire_radius_m=1.0,
+                reacquire_timeout_sec=4.0,
+            ),
+            task_id="planner-chair-memory",
+        )
+        system.update(_update_payload(1))
+
+        assert command_payload["memoryNavigationMode"] == "memory_pose"
+        assert _wait_until(lambda: len(system._navdp.step_calls) == 1)
+        status = system.status_payload()
+        assert len(system._system2.reset_calls) == 0
+        assert status["goal_world_xy"] == [2.0, 3.0]
+        assert status["resolvedMemoryObjectId"] == "obj-chair-1"
+        assert status["reacquireState"] == "approach_memory_pose"
+    finally:
+        system.shutdown()
+
+
+def test_navigation_service_memory_pose_reacquires_matching_detection(monkeypatch) -> None:
+    monkeypatch.setattr(navigation_service, "InternVlaNavClient", _GoalSystem2Client)
+    monkeypatch.setattr(navigation_service, "NavDpClient", _NavDpClient)
+
+    system = navigation_service.NavigationSystem(_args())
+    try:
+        system.command_memory_target(
+            navigation_service.MemoryNavigationTarget(
+                object_id="obj-chair-2",
+                class_name="chair",
+                scene_scope="warehouse",
+                world_pose_xyz=np.asarray((0.0, 0.0, 0.0), dtype=np.float32),
+                pose_age_sec=2.0,
+                stop_radius_m=0.8,
+                reacquire_radius_m=1.0,
+                reacquire_timeout_sec=4.0,
+            ),
+            task_id="planner-chair-memory",
+        )
+        status = system.update(
+            _update_payload(
+                1,
+                base_pos_w=(0.0, 0.0, 0.0),
+                detections=[
+                    {
+                        "class_name": "chair",
+                        "track_id": "track-chair-2",
+                        "bbox_xyxy": [0, 0, 1, 1],
+                        "confidence": 0.95,
+                        "world_pose_xyz": [0.2, 0.1, 0.0],
+                    }
+                ],
+            )
+        )
+
+        assert status["reacquireState"] == "reacquired"
+        assert status["last_error"] is None
+        assert status["memoryAwareTaskActive"] is True
+    finally:
+        system.shutdown()
+
+
+def test_navigation_service_memory_pose_times_out_when_detection_does_not_reappear(monkeypatch) -> None:
+    monkeypatch.setattr(navigation_service, "InternVlaNavClient", _GoalSystem2Client)
+    monkeypatch.setattr(navigation_service, "NavDpClient", _NavDpClient)
+
+    system = navigation_service.NavigationSystem(_args())
+    try:
+        system.command_memory_target(
+            navigation_service.MemoryNavigationTarget(
+                object_id="obj-chair-3",
+                class_name="chair",
+                scene_scope="warehouse",
+                world_pose_xyz=np.asarray((0.0, 0.0, 0.0), dtype=np.float32),
+                pose_age_sec=2.0,
+                stop_radius_m=0.8,
+                reacquire_radius_m=1.0,
+                reacquire_timeout_sec=0.01,
+            ),
+            task_id="planner-chair-memory",
+        )
+        system.update(_update_payload(1, base_pos_w=(0.0, 0.0, 0.0), detections=[]))
+        time.sleep(0.02)
+        status = system.update(_update_payload(2, base_pos_w=(0.0, 0.0, 0.0), detections=[]))
+
+        assert status["reacquireState"] == "failed"
+        assert status["last_error"] == "memory_target_not_reacquired"
+    finally:
+        system.shutdown()
+
+
+def test_navigation_service_status_exposes_current_robot_pose(monkeypatch) -> None:
+    monkeypatch.setattr(navigation_service, "InternVlaNavClient", _GoalSystem2Client)
+    monkeypatch.setattr(navigation_service, "NavDpClient", _NavDpClient)
+
+    system = navigation_service.NavigationSystem(_args())
+    try:
+        status = system.update(_update_payload(1, base_pos_w=(1.5, -0.5, 0.25)))
+
+        assert status["current_robot_pose"]["world_xy"] == [1.5, -0.5]
+        assert status["current_robot_pose"]["world_xyz"] == [1.5, -0.5, 0.25]
+        assert status["current_robot_pose"]["yaw_rad"] == 0.0
+        assert status["currentRobotPose"]["world_xy"] == [1.5, -0.5]
+    finally:
+        system.shutdown()
+
+
+def test_navigation_service_return_pose_sets_direct_goal_and_stops_at_origin(monkeypatch) -> None:
+    monkeypatch.setattr(navigation_service, "InternVlaNavClient", _GoalSystem2Client)
+    monkeypatch.setattr(navigation_service, "NavDpClient", _NavDpClient)
+    monkeypatch.setattr(
+        navigation_service,
+        "camera_plan_to_world_xy",
+        lambda trajectory_camera, camera_pos_w, camera_rot_w: np.asarray([[2.0, 3.0], [2.2, 3.0]], dtype=np.float32),
+    )
+
+    system = navigation_service.NavigationSystem(_args())
+    try:
+        command_payload = system.command_return_pose(
+            navigation_service.ReturnPoseTarget(
+                world_xy=np.asarray((2.0, 3.0), dtype=np.float32),
+                yaw_rad=0.0,
+            ),
+            task_id="planner-return",
+        )
+        status = system.update(_update_payload(1, base_pos_w=(2.0, 3.0, 0.0)))
+
+        assert command_payload["goal_world_xy"] == [2.0, 3.0]
+        assert command_payload["system2"]["status"] == "return_pose"
+        assert status["goal_world_xy"] is None
+        assert status["path_points"] == 0
+        assert status["system2"]["status"] == "stop"
+        assert status["system2"]["decision_mode"] == "stop"
+        assert status["current_robot_pose"]["world_xy"] == [2.0, 3.0]
+        assert status["returnTargetWorldXy"] == [2.0, 3.0]
+        assert len(system._system2.reset_calls) == 0
+        assert len(system._navdp.step_calls) == 0
     finally:
         system.shutdown()

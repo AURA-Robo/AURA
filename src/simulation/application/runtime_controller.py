@@ -18,6 +18,7 @@ from systems.inference.api.runtime import (
     resolve_goal_world_xy,
     resolve_goal_world_xy_from_pixel,
 )
+from systems.memory.knowledge_runtime import create_knowledge_runtime
 from systems.navigation.api.runtime import (
     FollowerState,
     HolonomicPurePursuitFollower,
@@ -30,7 +31,7 @@ from systems.navigation.api.runtime import (
     point_goal_body_from_world,
     yaw_from_quaternion_wxyz,
 )
-from systems.planner.api.runtime import AuraTaskingAdapter, make_http_completion
+from systems.reasoning.api.runtime import AuraTaskingAdapter, make_planner_task_frame_completion
 from systems.perception.api.camera_api import CameraPitchApiServer, G1NavCameraSensor, resolve_camera_control_prim_path
 from systems.world_state.api.runtime_state import (
     ActionOverrideState,
@@ -496,14 +497,29 @@ class InternVlaNavDpController:
             else f"g1-internvla-{int(time.time())}"
         )
         planner_base_url = str(getattr(args, "planner_base_url", "") or "").strip()
-        planner_completion = make_http_completion(planner_base_url) if planner_base_url else None
+        planner_completion = (
+            make_planner_task_frame_completion(
+                planner_base_url,
+                slot_id=int(getattr(args, "planner_task_frame_slot_id", 1)),
+            )
+            if planner_base_url
+            else None
+        )
+        knowledge_runtime = create_knowledge_runtime(
+            dsn=str(getattr(args, "knowledge_dsn", "") or ""),
+            scene_scope=str(getattr(args, "knowledge_scene_scope", "") or "").strip() or None,
+        )
         self._tasking = AuraTaskingAdapter(
             completion=planner_completion,
             model=str(getattr(args, "planner_model", "") or "").strip(),
             timeout=float(getattr(args, "planner_timeout", 120.0)),
+            knowledge_runtime=knowledge_runtime,
+            scene_scope=str(getattr(args, "knowledge_scene_scope", "") or "").strip() or None,
         )
         self._task_state: TaskExecutionState | None = None
         self._last_task_result: dict[str, object] | None = None
+        self._memory_navigation_target: dict[str, object] | None = None
+        self._memory_reacquire_state: str | None = None
 
         self._running = True
         self._lock = threading.Lock()
@@ -1029,6 +1045,8 @@ class InternVlaNavDpController:
                 goal_generation=goal_generation,
                 clear_reason=clear_reason,
             )
+            self._memory_navigation_target = None
+            self._memory_reacquire_state = None
         return {
             "instruction": next_instruction,
             "language": next_language,
@@ -1043,6 +1061,40 @@ class InternVlaNavDpController:
             language,
             clear_reason="task_navigate",
         )
+
+    def start_navigation_memory_goal(self, navigation_target: dict[str, object]) -> dict[str, object]:
+        world_pose_xyz = np.asarray(navigation_target["world_pose_xyz"], dtype=np.float32).reshape(3)
+        now = time.monotonic()
+        with self._lock:
+            current_state = self._pipeline_state
+            command_revision = current_state.command.command_revision + 1
+            goal_generation = current_state.goal.generation + 1
+            self._pipeline_state = self._make_reset_pipeline_state(
+                instruction=f"go to remembered {navigation_target.get('class_name') or 'target'}",
+                language="en",
+                command_revision=command_revision,
+                goal_generation=goal_generation,
+                clear_reason="task_memory_navigate",
+            )
+            self._pipeline_state.system2.session_reset_required = False
+            self._pipeline_state.system2.last_signature = None
+            self._pipeline_state.system2.last_result = None
+            self._pipeline_state.system2.error = None
+            self._clear_action_override_locked()
+            self._clear_navdp_locked(reset_algorithm=True, reset_progress=False)
+            self._pipeline_state.follower = make_follower_state()
+            self._set_locomotion_locked(_zero_command(), state_label="waiting", stamp_s=now)
+            self._update_goal(np.asarray(world_pose_xyz[:2], dtype=np.float32), now)
+            self._memory_navigation_target = dict(navigation_target)
+            self._memory_reacquire_state = "approach_memory_pose"
+        return {
+            "instruction": f"go to remembered {navigation_target.get('class_name') or 'target'}",
+            "language": "en",
+            "command_revision": command_revision,
+            "session_id": self._session_id,
+            "session_reset_required": False,
+            "goal_world_xy": [float(world_pose_xyz[0]), float(world_pose_xyz[1])],
+        }
 
     def start_return_to_origin(self, origin_pose: dict[str, object]) -> dict[str, object]:
         target_world_xy = np.asarray(origin_pose["world_xy"], dtype=np.float32).reshape(2)
@@ -1067,6 +1119,8 @@ class InternVlaNavDpController:
             self._pipeline_state.follower = make_follower_state()
             self._set_locomotion_locked(_zero_command(), state_label="waiting", stamp_s=now)
             self._update_goal(target_world_xy, now)
+            self._memory_navigation_target = None
+            self._memory_reacquire_state = None
         return {
             "instruction": "return to origin",
             "language": "en",
@@ -1087,6 +1141,8 @@ class InternVlaNavDpController:
             state_label = pipeline_state.locomotion.state_label
             action_override_mode = pipeline_state.action_override.mode
             tolerance = float(pipeline_state.goal.tolerance)
+            memory_navigation_target = None if self._memory_navigation_target is None else dict(self._memory_navigation_target)
+            memory_reacquire_state = self._memory_reacquire_state
         goal_reached = False
         return_pose_distance = None
         return_pose_reached = False
@@ -1117,6 +1173,14 @@ class InternVlaNavDpController:
             "goal_reached": goal_reached,
             "return_pose_distance": return_pose_distance,
             "return_pose_reached": return_pose_reached,
+            "memory_navigation_mode": None if memory_navigation_target is None else "memory_pose",
+            "resolved_memory_object_id": None if memory_navigation_target is None else memory_navigation_target.get("object_id"),
+            "resolved_memory_pose_age_sec": None if memory_navigation_target is None else memory_navigation_target.get("pose_age_sec"),
+            "reacquire_state": (
+                "reacquire_pending"
+                if memory_navigation_target is not None and goal_reached and memory_reacquire_state == "approach_memory_pose"
+                else memory_reacquire_state
+            ),
         }
         return snapshot
 
@@ -1135,7 +1199,11 @@ class InternVlaNavDpController:
                 return False
             if task.origin_pose is None:
                 task.origin_pose = self._capture_origin_pose()
-            runtime = {"controller": self, "task_state": task}
+            runtime = {
+                "controller": self,
+                "task_state": task,
+                "scene_preset": str(getattr(self._args, "knowledge_scene_scope", "") or "").strip() or None,
+            }
         event = self._tasking.step(task.subgoals, runtime)
         if event is None:
             return False
@@ -1215,6 +1283,8 @@ class InternVlaNavDpController:
             last_action_only_mode = pipeline_state.status.last_action_only_mode
             task_state = self._task_state
             last_task_result = self._last_task_result
+            memory_navigation_target = None if self._memory_navigation_target is None else dict(self._memory_navigation_target)
+            memory_reacquire_state = self._memory_reacquire_state
         camera_target_pitch_deg = self._current_target_pitch_deg()
         payload: dict[str, object] = {
             "instruction": instruction,
@@ -1241,6 +1311,11 @@ class InternVlaNavDpController:
             "navdp_supports_pixelgoal": navdp_supports_pixelgoal,
             "action_only_suppressed": action_only_suppressed,
             "last_action_only_mode": last_action_only_mode,
+            "memoryAwareTaskActive": memory_navigation_target is not None,
+            "memoryNavigationMode": None if memory_navigation_target is None else "memory_pose",
+            "resolvedMemoryObjectId": None if memory_navigation_target is None else memory_navigation_target.get("object_id"),
+            "resolvedMemoryPoseAgeSec": None if memory_navigation_target is None else memory_navigation_target.get("pose_age_sec"),
+            "reacquireState": memory_reacquire_state,
         }
         if goal_world_xy is not None:
             payload["goal_world_xy"] = [float(goal_world_xy[0]), float(goal_world_xy[1])]
@@ -1296,7 +1371,12 @@ class InternVlaNavDpController:
             print("[INFO] Runtime navigation command accepted: STOP")
             return response
 
-        task_frame = self._tasking.plan_task_frame(next_instruction)
+        task_frame = self._tasking.plan_task_frame(
+            next_instruction,
+            planning_context={
+                "scene_preset": str(getattr(self._args, "knowledge_scene_scope", "") or "").strip() or None,
+            },
+        )
         subgoals = self._tasking.initialize_subgoals(task_frame)
         created_at = time.monotonic()
         task_state = TaskExecutionState(

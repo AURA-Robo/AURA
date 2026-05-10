@@ -1,30 +1,21 @@
-# AURA Architecture Docs
+# AURA System Documentation
 
-이 디렉토리는 현재 `main` 기준의 AURA 런타임 구조를 설명한다.
+This directory contains the canonical documentation for the AURA system
+runtime, backend, and subsystem boundaries.
 
-기준 범위:
+## Documents
 
-- G1 runtime 중앙 서버 전환
-- A-F 단계까지 반영된 write/read model
-- worker contract, observability, recovery state machine
+- [architecture.md](./architecture.md)
+  - System architecture, process boundaries, runtime data flow, and dashboard
+    frontend/backend integration.
+- [systems/README.md](./systems/README.md)
+  - Subsystem catalog moved from the former `sub/` directory and updated for
+    the current `src/systems` layout.
 
-문서 구성:
+## Notes
 
-- [architecture/AURA_RUNTIME_ARCHITECTURE.md](./architecture/AURA_RUNTIME_ARCHITECTURE.md)
-  - 현재 중앙 서버 구조와 G1 실행 흐름
-- [architecture/STATE_AND_OBSERVABILITY.md](./architecture/STATE_AND_OBSERVABILITY.md)
-  - write-side state, read-side snapshot, dashboard/WebRTC/legacy mirror
-- [architecture/WORKER_CONTRACTS_AND_RECOVERY.md](./architecture/WORKER_CONTRACTS_AND_RECOVERY.md)
-  - worker request/result contract, validation, recovery state machine
-- [architecture/MIGRATION_SUMMARY_A_TO_F.md](./architecture/MIGRATION_SUMMARY_A_TO_F.md)
-  - A-F 단계별 변경 요약
-- [architecture/SYSTEM_DIAGRAM_STRUCTURE.md](./architecture/SYSTEM_DIAGRAM_STRUCTURE.md)
-  - 다이어그램 작성용 시스템 구조, 노드/엣지, control/observability 흐름
-- [architecture/SYSTEM2_TALK_NAV_LORA_DESIGN.md](./architecture/SYSTEM2_TALK_NAV_LORA_DESIGN.md)
-  - 단일 VLM 기준 TALK/NAV 라우팅, 프롬프트, LoRA 데이터셋/학습 설계
-
-문서 원칙:
-
-- 현재 코드를 기준으로 서술한다.
-- 과거 bridge/session/orchestrator 중심 설명은 더 이상 canonical하지 않다.
-- G/H 범위는 아직 완료되지 않았으므로 이 문서들은 A-F 완료 상태까지만 확정적으로 다룬다.
+- Source of truth for runtime code is `src/`.
+- Source of truth for subsystem ownership is `src/systems`.
+- The dashboard frontend is a sibling project at
+  `C:\Users\mango\project\AURA\dashboard`.
+- The system backend is in this repository under `src/backend`.

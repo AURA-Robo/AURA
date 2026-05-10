@@ -15,7 +15,7 @@ from systems.shared.contracts.observation import (
 )
 
 if TYPE_CHECKING:
-    from systems.navigation.api.runtime import RobotState2D
+    from systems.shared.contracts.navigation import RobotState2D
 
 
 def _copy_rgb(rgb: np.ndarray) -> np.ndarray:

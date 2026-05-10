@@ -10,14 +10,27 @@ from typing import Iterable
 from systems.shared.contracts.dashboard import LogRecord
 
 
-def tail_log(path: str | Path, *, limit: int = 40, source: str, stream: str) -> list[dict[str, object]]:
+def tail_log(
+    path: str | Path,
+    *,
+    limit: int = 40,
+    source: str,
+    stream: str,
+    start_offset: int | None = None,
+) -> list[dict[str, object]]:
     target = Path(path)
     if not target.is_file():
         return []
     lines = deque(maxlen=max(1, int(limit)))
-    with target.open("r", encoding="utf-8", errors="ignore") as handle:
+    file_size = target.stat().st_size
+    offset = int(start_offset or 0)
+    if offset < 0 or offset > file_size:
+        offset = 0
+    with target.open("rb") as handle:
+        if offset:
+            handle.seek(offset)
         for line in handle:
-            text = line.rstrip()
+            text = line.decode("utf-8", errors="ignore").rstrip()
             if text:
                 lines.append(text)
     now_ns = int(time.time() * 1_000_000_000)

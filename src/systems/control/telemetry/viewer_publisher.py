@@ -23,17 +23,28 @@ class ViewerFramePublisher:
     """Bridge camera frames into the backend-owned WebRTC transport."""
 
     def __init__(self) -> None:
-        self._bus = ZmqBus(
-            control_endpoint=VIEWER_CONTROL_ENDPOINT,
-            telemetry_endpoint=VIEWER_TELEMETRY_ENDPOINT,
-            role="bridge",
-        )
-        self._shm = SharedMemoryRing(
-            name=VIEWER_SHM_NAME,
-            slot_size=VIEWER_SHM_SLOT_SIZE,
-            capacity=VIEWER_SHM_CAPACITY,
-            create=True,
-        )
+        self._bus = None
+        self._shm = None
+        try:
+            self._bus = ZmqBus(
+                control_endpoint=VIEWER_CONTROL_ENDPOINT,
+                telemetry_endpoint=VIEWER_TELEMETRY_ENDPOINT,
+                role="bridge",
+            )
+            self._shm = SharedMemoryRing(
+                name=VIEWER_SHM_NAME,
+                slot_size=VIEWER_SHM_SLOT_SIZE,
+                capacity=VIEWER_SHM_CAPACITY,
+                create=True,
+            )
+        except Exception:
+            if self._shm is not None:
+                self._shm.close(unlink=True)
+                self._shm = None
+            if self._bus is not None:
+                self._bus.close()
+                self._bus = None
+            raise
         self._sequence = 0
         self._last_health_ns = 0
 
@@ -97,8 +108,12 @@ class ViewerFramePublisher:
         }
 
     def close(self) -> None:
-        self._shm.close(unlink=True)
-        self._bus.close()
+        if self._shm is not None:
+            self._shm.close(unlink=True)
+            self._shm = None
+        if self._bus is not None:
+            self._bus.close()
+            self._bus = None
 
     def _maybe_publish_health(self, *, frame_id: int, frame_stamp_s: float, width: int, height: int, depth_available: bool) -> None:
         now_ns = time.time_ns()
@@ -119,7 +134,7 @@ class ViewerFramePublisher:
                         "depthAvailable": bool(depth_available),
                         "controlEndpoint": VIEWER_CONTROL_ENDPOINT,
                         "telemetryEndpoint": VIEWER_TELEMETRY_ENDPOINT,
-                        "shmName": VIEWER_SHM_NAME,
+                        "shmName": self._shm.name,
                     }
                 },
             ),

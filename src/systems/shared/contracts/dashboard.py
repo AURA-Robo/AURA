@@ -34,6 +34,8 @@ class ProcessRecord:
     healthUrl: str
     stdoutLog: str
     stderrLog: str
+    stdoutLogOffset: int | None = None
+    stderrLogOffset: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

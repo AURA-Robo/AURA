@@ -65,6 +65,7 @@ DEFAULT_CHECK_SESSION_SYSTEM_PROMPT = (
     "Respond with exactly one lowercase token: true or false. "
     "If the image does not clearly support true, respond false."
 )
+DEFAULT_CHECK_LORA_SCALE = 1.0
 LLAMA_LOOK_DOWN_IMAGE_TOKEN_BUDGET = 196
 LLAMA_LOOK_DOWN_TEXT_TOKEN_RESERVE = 320
 AURA_ROOT = Path(__file__).resolve().parents[4]
@@ -132,6 +133,13 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or str(raw).strip() == "":
         return int(default)
     return int(str(raw).strip())
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    return float(str(raw).strip())
 
 
 def _env_optional_str(name: str) -> str | None:
@@ -218,6 +226,17 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
             "INTERNVLA_CHECK_SESSION_SYSTEM_PROMPT",
             _env_str("INTERNVLA_CHECK_SYSTEM_PROMPT", DEFAULT_CHECK_SESSION_SYSTEM_PROMPT),
         ),
+    )
+    parser.add_argument(
+        "--check-lora-adapter-path",
+        dest="check_lora_adapter_path",
+        default=_env_str("INTERNVLA_CHECK_LORA_ADAPTER_PATH", ""),
+    )
+    parser.add_argument(
+        "--check-lora-scale",
+        dest="check_lora_scale",
+        type=float,
+        default=_env_float("INTERNVLA_CHECK_LORA_SCALE", DEFAULT_CHECK_LORA_SCALE),
     )
     parser.add_argument(
         "--default-check-session-id",
@@ -309,6 +328,18 @@ def prepare_runtime_args(args: Namespace) -> Namespace:
     args.llama_cache_type_v = _normalize_cache_type(
         getattr(args, "llama_cache_type_v", DEFAULT_LLAMA_CACHE_TYPE_V)
     )
+    check_lora_adapter_path = str(getattr(args, "check_lora_adapter_path", "") or "").strip()
+    args.check_lora_adapter_path = (
+        _validate_llama_file(Path(check_lora_adapter_path), "INTERNVLA_CHECK_LORA_ADAPTER_PATH")
+        if check_lora_adapter_path
+        else None
+    )
+    try:
+        args.check_lora_scale = float(getattr(args, "check_lora_scale", DEFAULT_CHECK_LORA_SCALE))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("INTERNVLA_CHECK_LORA_SCALE must be a positive number.") from exc
+    if args.check_lora_scale <= 0.0:
+        raise SystemExit("INTERNVLA_CHECK_LORA_SCALE must be positive.")
     args.default_check_session_id = (
         str(getattr(args, "default_check_session_id", DEFAULT_CHECK_SESSION_ID)).strip()
         or DEFAULT_CHECK_SESSION_ID
@@ -544,15 +575,16 @@ class LlamaCppSidecarManager:
         self.embeddings = True
         self.cache_type_k = _normalize_cache_type(getattr(args, "llama_cache_type_k", DEFAULT_LLAMA_CACHE_TYPE_K))
         self.cache_type_v = _normalize_cache_type(getattr(args, "llama_cache_type_v", DEFAULT_LLAMA_CACHE_TYPE_V))
-        self.chat_lora_path = None
-        self.chat_lora_scale = 1.0
+        check_lora_path = str(getattr(args, "check_lora_adapter_path", "") or "").strip()
+        self.check_lora_path = Path(check_lora_path).expanduser().resolve() if check_lora_path else None
+        self.check_lora_scale = float(getattr(args, "check_lora_scale", DEFAULT_CHECK_LORA_SCALE))
         self.hf_prompt_model_path = self._resolve_hf_prompt_model_path(getattr(args, "model_path", None))
         self._hf_prompt_processor = None
         self._hf_prompt_load_attempted = False
         self._hf_prompt_error: str | None = None
         self._hf_low_level_completions_enabled = True
         self._lora_adapters_cache: list[dict[str, Any]] | None = None
-        self._chat_lora_id: int | None = None
+        self._check_lora_id: int | None = None
         self._process: subprocess.Popen[str] | None = None
         self._spawned = False
         self._stdout_handle = None
@@ -572,7 +604,7 @@ class LlamaCppSidecarManager:
             parallel_slots=self.parallel_slots,
             cache_type_k=self.cache_type_k,
             cache_type_v=self.cache_type_v,
-            chat_lora_path=self.chat_lora_path,
+            chat_lora_path=self.check_lora_path,
             lora_init_without_apply=True,
         )
         if auto_start:
@@ -645,7 +677,7 @@ class LlamaCppSidecarManager:
         self._process = None
         self._props_cache = None
         self._lora_adapters_cache = None
-        self._chat_lora_id = None
+        self._check_lora_id = None
         if self._stdout_handle is not None:
             self._stdout_handle.close()
             self._stdout_handle = None
@@ -670,7 +702,7 @@ class LlamaCppSidecarManager:
         return body
 
     def list_lora_adapters(self, *, refresh: bool = False) -> list[dict[str, Any]]:
-        if self.chat_lora_path is None:
+        if self.check_lora_path is None:
             return []
         if refresh or self._lora_adapters_cache is None:
             self.ensure_running()
@@ -682,13 +714,13 @@ class LlamaCppSidecarManager:
             self._lora_adapters_cache = [dict(item) for item in body if isinstance(item, dict)]
         return copy.deepcopy(self._lora_adapters_cache)
 
-    def resolve_chat_lora_id(self, *, refresh: bool = False) -> int | None:
-        if self.chat_lora_path is None:
+    def resolve_check_lora_id(self, *, refresh: bool = False) -> int | None:
+        if self.check_lora_path is None:
             return None
-        if self._chat_lora_id is not None and not refresh:
-            return int(self._chat_lora_id)
-        target = str(self.chat_lora_path).lower()
-        target_name = self.chat_lora_path.name.lower()
+        if self._check_lora_id is not None and not refresh:
+            return int(self._check_lora_id)
+        target = str(self.check_lora_path).lower()
+        target_name = self.check_lora_path.name.lower()
         adapters = self.list_lora_adapters(refresh=refresh)
         for adapter in adapters:
             adapter_id = adapter.get("id")
@@ -698,17 +730,23 @@ class LlamaCppSidecarManager:
             adapter_name = Path(adapter_path).name.lower()
             adapter_resolved = str(Path(adapter_path).expanduser()).lower()
             if adapter_name == target_name or adapter_resolved == target or adapter_path.lower() == target:
-                self._chat_lora_id = int(adapter_id)
-                return int(self._chat_lora_id)
+                self._check_lora_id = int(adapter_id)
+                return int(self._check_lora_id)
         raise RuntimeError(
-            "Configured chat LoRA adapter was not reported by llama.cpp /lora-adapters: "
-            f"path={self.chat_lora_path}"
+            "Configured check LoRA adapter was not reported by llama.cpp /lora-adapters: "
+            f"path={self.check_lora_path}"
         )
 
-    def chat_lora_request(self) -> list[dict[str, Any]]:
-        if self.chat_lora_path is None:
+    def check_lora_request(self) -> list[dict[str, Any]]:
+        if self.check_lora_path is None:
             return []
-        return [{"id": int(self.resolve_chat_lora_id()), "scale": float(self.chat_lora_scale)}]
+        return [{"id": int(self.resolve_check_lora_id()), "scale": float(self.check_lora_scale)}]
+
+    def resolve_chat_lora_id(self, *, refresh: bool = False) -> int | None:
+        return self.resolve_check_lora_id(refresh=refresh)
+
+    def chat_lora_request(self) -> list[dict[str, Any]]:
+        return self.check_lora_request()
 
     def props(self, *, refresh: bool = False) -> dict[str, Any]:
         self._cleanup_dead_process()
@@ -765,7 +803,7 @@ class LlamaCppSidecarManager:
         self.stdout_log.parent.mkdir(parents=True, exist_ok=True)
         self._props_cache = None
         self._lora_adapters_cache = None
-        self._chat_lora_id = None
+        self._check_lora_id = None
         self._stdout_handle = open(self.stdout_log, "w", encoding="utf-8")
         self._stderr_handle = open(self.stderr_log, "w", encoding="utf-8")
         self._process = subprocess.Popen(
@@ -796,7 +834,7 @@ class LlamaCppSidecarManager:
             self._process = None
             self._props_cache = None
             self._lora_adapters_cache = None
-            self._chat_lora_id = None
+            self._check_lora_id = None
 
     def health_payload(self) -> dict[str, Any]:
         health_now = self.healthy()
@@ -819,6 +857,9 @@ class LlamaCppSidecarManager:
             "embeddings": self.embeddings,
             "llama_cache_type_k": self.cache_type_k,
             "llama_cache_type_v": self.cache_type_v,
+            "check_lora_configured": self.check_lora_path is not None,
+            "check_lora_adapter_path": None if self.check_lora_path is None else str(self.check_lora_path),
+            "check_lora_scale": self.check_lora_scale,
             "hf_prompt_serialization": self.hf_prompt_model_path is not None,
             "hf_prompt_model_path": None if self.hf_prompt_model_path is None else str(self.hf_prompt_model_path),
             "hf_low_level_completions_enabled": self._hf_low_level_completions_enabled,
@@ -1080,6 +1121,8 @@ class LlamaCppDualVLNRuntime:
             "llama_parallel_slots": self.llama_parallel_slots,
             "llama_nav_slot": self.nav_slot_id,
             "llama_check_slot": self.check_slot_id,
+            "nav_slot_id": self.nav_slot_id,
+            "check_slot_id": self.check_slot_id,
             "llama_cache_type_k": _normalize_cache_type(
                 getattr(self._args, "llama_cache_type_k", DEFAULT_LLAMA_CACHE_TYPE_K)
             ),
@@ -1105,9 +1148,20 @@ class LlamaCppDualVLNRuntime:
     @classmethod
     def _normalize_check_answer(cls, response: dict[str, Any]) -> str:
         answer = cls._extract_completion_text(response).strip().lower()
-        if answer not in {"true", "false"}:
-            raise RuntimeError(f"/check must return exactly true or false, got: {answer!r}")
-        return answer
+        tokens = re.findall(r"[a-z]+", answer)
+        if answer in {"true", "false"}:
+            return answer
+        truth_values = {"true": "true", "yes": "true", "y": "true"}
+        false_values = {"false": "false", "no": "false", "n": "false"}
+        normalized_values = {
+            value
+            for token in tokens
+            for value in (truth_values.get(token), false_values.get(token))
+            if value is not None
+        }
+        if len(normalized_values) == 1:
+            return next(iter(normalized_values))
+        raise RuntimeError(f"/check must return a binary true/false answer, got: {answer!r}")
 
     def open_check_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._reject_custom_check_system_prompt(payload)
@@ -1152,7 +1206,7 @@ class LlamaCppDualVLNRuntime:
                 max_tokens=max_tokens,
                 slot_id=self.check_slot_id,
                 cache_prompt=False,
-                lora=None,
+                lora=self._sidecar.check_lora_request(),
             )
         answer = self._normalize_check_answer(response)
         with self._check_session_lock:
@@ -1766,6 +1820,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[INFO] Llama model   : {args.llama_model_path}")
     print(f"[INFO] Llama mmproj  : {args.llama_mmproj_path}")
     print(f"[INFO] Check prompt  : {args.check_session_system_prompt}")
+    print(f"[INFO] Check LoRA    : {args.check_lora_adapter_path or 'disabled'}")
+    print(f"[INFO] Check LoRA scale      : {args.check_lora_scale:.3f}")
     print(f"[INFO] Default check session     : {args.default_check_session_id}")
     print(f"[INFO] Default check auto-open   : {args.default_check_session_auto_open}")
     print(f"[INFO] Llama ctx     : {args.llama_ctx_size}")

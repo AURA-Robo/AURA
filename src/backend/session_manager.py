@@ -4,26 +4,37 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from pathlib import Path
 import time
 from typing import Any
+import uuid
 
 from backend.app_keys import (
+    AGENT_MEMORY_RUNTIME,
     API_BASE_URL,
     CONTROL_RUNTIME_URL,
     HTTP,
     INFERENCE_SYSTEM_URL,
+    KNOWLEDGE_RUNTIME,
     NAVIGATION_SYSTEM_URL,
-    PLANNER_SYSTEM_URL,
+    REASONING_SYSTEM_URL,
+    ROOT_DIR,
     RUNTIME_OWNED,
     RUNTIME_SERVICE,
     RUNTIME_URL,
     WEBRTC_SERVICE,
 )
 from backend.models import DashboardStateBuilder, build_dashboard_catalog, parse_session_config
+from backend.runtime_context_summary import (
+    render_runtime_context_summary,
+    runtime_context_summary_path,
+    persist_runtime_context_summary,
+    summary_generated_at,
+)
 from backend.sources.control_runtime import fetch_runtime_status
 from backend.sources.logs import merge_logs, tail_log
 from backend.sources.navigation_system import fetch_navigation_status
-from backend.sources.planner_system import fetch_planner_status
+from backend.sources.reasoning_system import fetch_reasoning_status
 from backend.sources.runtime import fetch_runtime_state, post_runtime_session
 from systems.shared.contracts.dashboard import LogRecord
 
@@ -131,12 +142,17 @@ def _selected_target_from_frame_meta(frame_meta: dict[str, Any] | None) -> dict[
 
 def _selected_target_from_status(
     runtime_status: dict[str, Any] | None,
-    planner_status: dict[str, Any] | None,
+    reasoning_status: dict[str, Any] | None,
     navigation_status: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     runtime_payload = _as_dict(runtime_status)
-    planner_payload = _as_dict(planner_status)
+    reasoning_payload = _as_dict(reasoning_status)
     navigation_payload = _as_dict(navigation_status)
+    active_target = _as_dict(_overlay_value(navigation_payload, "activeTarget", "active_target"))
+    if active_target:
+        summary = _selected_target_from_frame_meta({"activeTarget": active_target})
+        if summary is not None:
+            return summary
     nav_goal_pixel = _pixel_pair(
         _overlay_value(
             runtime_payload,
@@ -162,7 +178,7 @@ def _selected_target_from_status(
     if nav_goal_pixel is None and system2_pixel_goal is None and world_goal is None:
         return None
 
-    current_subgoal = _as_dict(planner_payload.get("current_subgoal"))
+    current_subgoal = _as_dict(reasoning_payload.get("current_subgoal"))
     label = (
         current_subgoal.get("label")
         or current_subgoal.get("target")
@@ -239,6 +255,13 @@ class DashboardSessionManager:
         self._probe_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._state_cache_ttl_s = 0.25
         self._probe_cache_ttl_s = 1.0
+        self._conversation_id: str | None = None
+        self.last_agent_response = dict(self.state_builder.default_state()["runtime"]["agentResponse"])
+
+    def ensure_conversation_id(self) -> str:
+        if not self._conversation_id:
+            self._conversation_id = str(uuid.uuid4())
+        return self._conversation_id
 
     def _invalidate_caches(self) -> None:
         self._state_cache = None
@@ -248,10 +271,41 @@ class DashboardSessionManager:
     def _set_session_config(self, config: dict[str, Any] | None) -> None:
         self._session_config_epoch += 1
         self.session_config = None if config is None else dict(config)
+        self._sync_object_memory_policy(self.session_config)
         self._invalidate_caches()
+
+    def _sync_object_memory_policy(self, config: dict[str, Any] | None) -> None:
+        webrtc_service = self.app.get(WEBRTC_SERVICE)
+        if webrtc_service is None:
+            return
+        setter = getattr(webrtc_service, "set_object_memory_enabled", None)
+        scene_scope_setter = getattr(webrtc_service, "set_object_memory_scene_scope", None)
+        if not callable(setter):
+            return
+        config_payload = _as_dict(config)
+        setter(bool(config_payload.get("memoryStore")))
+        if callable(scene_scope_setter):
+            scene_scope_setter(str(config_payload.get("scenePreset") or "").strip() or None)
 
     def record_event(self, message: str, *, level: str = "info") -> None:
         self.last_event = _event(message, level=level)
+        self._state_cache = None
+        self._state_cache_expires_at = 0.0
+
+    def record_agent_response(self, response_payload: dict[str, Any]) -> None:
+        reply_text = " ".join(str(response_payload.get("reply_text", "")).strip().split())
+        route = str(response_payload.get("route") or "unknown").strip() or "unknown"
+        request_id = str(response_payload.get("request_id") or "").strip() or None
+        conversation_id = str(response_payload.get("conversation_id") or "").strip() or None
+        error = response_payload.get("error")
+        self.last_agent_response = {
+            "text": reply_text,
+            "route": route,
+            "requestId": request_id,
+            "conversationId": conversation_id,
+            "error": None if error in (None, "") else str(error),
+            "at": time.time(),
+        }
         self._state_cache = None
         self._state_cache_expires_at = 0.0
 
@@ -280,6 +334,35 @@ class DashboardSessionManager:
             raise RuntimeError("backend-owned runtime service is not configured")
         return service
 
+    async def build_runtime_context_summary(
+        self,
+        *,
+        force_refresh: bool = True,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        state = await self.build_state(force_refresh=force_refresh)
+        summary_text = render_runtime_context_summary(state)
+        root_dir = Path(str(self.app[ROOT_DIR]))
+        target_path = runtime_context_summary_path(root_dir)
+        persisted = False
+        persist_error: str | None = None
+        if persist:
+            try:
+                await asyncio.to_thread(persist_runtime_context_summary, root_dir, summary_text)
+            except Exception as exc:  # noqa: BLE001
+                persist_error = f"{type(exc).__name__}: {exc}"
+                self.record_event(f"runtime context summary persistence failed: {persist_error}", level="warning")
+            else:
+                persisted = True
+        return {
+            "ok": True,
+            "summaryText": summary_text,
+            "path": str(target_path),
+            "generatedAt": summary_generated_at(state),
+            "persisted": persisted,
+            "persistError": persist_error,
+        }
+
     async def start_session(self, config: dict[str, Any]) -> dict[str, Any]:
         normalized_config = parse_session_config(config)
         if self.app[RUNTIME_OWNED]:
@@ -294,9 +377,11 @@ class DashboardSessionManager:
             )
         if response.get("ok"):
             self._set_session_config(dict(normalized_config))
+            self._conversation_id = str(uuid.uuid4())
             return await self.build_state(force_refresh=True)
         self.record_event(str(response.get("error") or response.get("lastError") or "runtime start failed"), level="error")
         self._set_session_config(None)
+        self._conversation_id = None
         return await self.build_state(force_refresh=True)
 
     async def stop_session(self) -> dict[str, Any]:
@@ -312,6 +397,7 @@ class DashboardSessionManager:
             )
         if response.get("ok"):
             self._set_session_config(None)
+            self._conversation_id = None
             return await self.build_state(force_refresh=True)
         self.record_event(str(response.get("error") or response.get("lastError") or "runtime stop failed"), level="error")
         return await self.build_state(force_refresh=True)
@@ -342,6 +428,7 @@ class DashboardSessionManager:
         state = self.state_builder.default_state()
         state["timestamp"] = time.time()
         state["session"]["lastEvent"] = self.last_event
+        state["runtime"]["agentResponse"] = dict(self.last_agent_response)
         session_config_epoch = self._session_config_epoch
         webrtc_service = self.app[WEBRTC_SERVICE]
         webrtc_health = None if webrtc_service is None else webrtc_service.health_snapshot()
@@ -365,6 +452,11 @@ class DashboardSessionManager:
                     "mediaEgress": webrtc_health.get("mediaEgress"),
                 }
             )
+        object_memory_health = (
+            _as_dict(webrtc_health.get("objectMemory"))
+            if isinstance(webrtc_health, dict)
+            else {}
+        )
 
         if self.app[RUNTIME_OWNED]:
             try:
@@ -374,7 +466,7 @@ class DashboardSessionManager:
         else:
             runtime_service_result = await fetch_runtime_state(self.app[HTTP], self.app[RUNTIME_URL])
 
-        runtime_result, planner_result, navigation_result = await asyncio.gather(
+        runtime_result, reasoning_result, navigation_result = await asyncio.gather(
             self._cached_probe(
                 "control_runtime_status",
                 fetch_runtime_status,
@@ -382,9 +474,9 @@ class DashboardSessionManager:
                 force_refresh=force_refresh,
             ),
             self._cached_probe(
-                "planner_status",
-                fetch_planner_status,
-                self.app[PLANNER_SYSTEM_URL],
+                "reasoning_status",
+                fetch_reasoning_status,
+                self.app[REASONING_SYSTEM_URL],
                 force_refresh=force_refresh,
             ),
             self._cached_probe(
@@ -396,7 +488,7 @@ class DashboardSessionManager:
         )
         inference_result: dict[str, Any] = {"ok": False, "error": "navigation-owned backends"}
         runtime_status_payload: dict[str, Any] | None = None
-        planner_status_payload: dict[str, Any] | None = None
+        reasoning_status_payload: dict[str, Any] | None = None
         navigation_status_payload: dict[str, Any] | None = None
 
         state["services"]["runtime"] = {
@@ -437,7 +529,10 @@ class DashboardSessionManager:
             }
             state["processes"] = []
 
+        self._sync_object_memory_policy(_as_dict(state["session"].get("config")))
+        state["session"]["conversationId"] = self._conversation_id
         configured_viewer_enabled = bool(_as_dict(state["session"].get("config")).get("viewerEnabled"))
+        configured_memory_enabled = bool(_as_dict(state["session"].get("config")).get("memoryStore"))
         if isinstance(webrtc_health, dict):
             transport_mode = "disabled" if not configured_viewer_enabled else str(webrtc_health.get("transport") or "")
             frame_available = bool(webrtc_health.get("frameAvailable"))
@@ -483,6 +578,71 @@ class DashboardSessionManager:
                 state["architecture"]["modules"]["telemetry"]["detail"] = str(
                     webrtc_health.get("source") or "viewer unavailable"
                 )
+
+        if object_memory_health:
+            object_count = object_memory_health.get("objectCount")
+            observation_count = object_memory_health.get("observationCount")
+            state["memory"].update(
+                {
+                    "objectCount": int(object_count) if isinstance(object_count, (int, float)) else 0,
+                    "objectMemoryEnabled": bool(object_memory_health.get("enabled")),
+                    "objectMemoryAvailable": bool(object_memory_health.get("available")),
+                    "observationCount": int(observation_count) if isinstance(observation_count, (int, float)) else 0,
+                    "lastPersistOk": object_memory_health.get("lastSuccess"),
+                    "lastObservedAt": object_memory_health.get("lastObservedAt"),
+                }
+            )
+            state["latencyBreakdown"]["memoryLatencyMs"] = object_memory_health.get("lastIngestLatencyMs")
+            memory_module = state["architecture"]["modules"]["memory"]
+            if not configured_memory_enabled:
+                memory_module["status"] = "inactive"
+                memory_module["summary"] = "Object memory disabled"
+                memory_module["detail"] = "memoryStore=false"
+            elif bool(object_memory_health.get("available")) and not object_memory_health.get("lastError"):
+                memory_module["status"] = "healthy"
+                memory_module["summary"] = f"{state['memory']['objectCount']} objects stored"
+                memory_module["detail"] = str(object_memory_health.get("lastObservedAt") or "ingest idle")
+            elif bool(object_memory_health.get("configured")):
+                memory_module["status"] = "degraded"
+                memory_module["summary"] = "Object memory degraded"
+                memory_module["detail"] = str(
+                    object_memory_health.get("lastError")
+                    or object_memory_health.get("degradedReason")
+                    or "object memory unavailable"
+                )
+            else:
+                memory_module["status"] = "inactive"
+                memory_module["summary"] = "Object memory unconfigured"
+                memory_module["detail"] = "AURA_OBJECT_MEMORY_DSN not set"
+
+        knowledge_runtime = self.app.get(KNOWLEDGE_RUNTIME)
+        if knowledge_runtime is not None:
+            knowledge_status = knowledge_runtime.status_snapshot()
+            state["memory"].update(
+                {
+                    "knowledgeEnabled": bool(knowledge_status.knowledge_enabled),
+                    "publishedDocumentCount": int(knowledge_status.published_document_count),
+                    "activeHardRuleCount": int(knowledge_status.active_hard_rule_count),
+                    "lexiconEntryCount": int(knowledge_status.lexicon_entry_count),
+                    "lastKnowledgeRefreshOk": knowledge_status.last_refresh_ok,
+                    "lastAppliedRuleIds": list(knowledge_status.last_applied_rule_ids),
+                    "knowledgeDegradedReason": knowledge_status.degraded_reason,
+                    "semanticRuleCount": int(knowledge_status.active_hard_rule_count),
+                }
+            )
+
+        agent_memory_runtime = self.app.get(AGENT_MEMORY_RUNTIME)
+        if agent_memory_runtime is not None:
+            agent_memory_status = agent_memory_runtime.status_snapshot()
+            state["memory"].update(
+                {
+                    "agentMemoryEnabled": bool(agent_memory_status.enabled),
+                    "agentMemoryAvailable": bool(agent_memory_status.available),
+                    "agentMemoryCoreBlockCount": int(agent_memory_status.core_block_count),
+                    "agentMemoryArchivalPassageCount": int(agent_memory_status.archival_passage_count),
+                    "agentMemoryDegradedReason": agent_memory_status.degraded_reason,
+                }
+            )
 
         if runtime_result.get("ok"):
             runtime_status = dict(runtime_result["status"])
@@ -547,39 +707,69 @@ class DashboardSessionManager:
             state["runtime"]["lastStatusEvent"] = {"state": "unreachable", "reason": runtime_result.get("error")}
             state["transport"]["viewerEnabled"] = bool((self.session_config or {}).get("viewerEnabled"))
 
-        if planner_result.get("ok"):
-            planner_status = dict(planner_result["status"])
-            planner_status_payload = dict(planner_status)
-            state["runtime"]["plannerControlMode"] = planner_status.get("task_status", "idle")
-            state["runtime"]["activeInstruction"] = planner_status.get("instruction") or ""
-            state["runtime"]["taskId"] = planner_status.get("task_id")
-            state["runtime"]["taskFrame"] = planner_status.get("task_frame")
-            state["runtime"]["currentSubgoal"] = planner_status.get("current_subgoal")
-            state["runtime"]["subgoals"] = planner_status.get("subgoals", [])
+        if reasoning_result.get("ok"):
+            reasoning_status = dict(reasoning_result["status"])
+            reasoning_status_payload = dict(reasoning_status)
+            state["runtime"]["reasoningTaskStatus"] = reasoning_status.get("task_status", "idle")
+            state["runtime"]["plannerControlMode"] = state["runtime"]["reasoningTaskStatus"]
+            state["runtime"]["reasoningRoute"] = reasoning_status.get("last_route")
+            state["runtime"]["lastDialogueReplyAt"] = reasoning_status.get("last_dialogue_reply_at")
+            state["runtime"]["activeInstruction"] = reasoning_status.get("instruction") or ""
+            state["runtime"]["taskId"] = reasoning_status.get("task_id")
+            state["runtime"]["taskFrame"] = reasoning_status.get("task_frame")
+            state["runtime"]["currentSubgoal"] = reasoning_status.get("current_subgoal")
+            state["runtime"]["subgoals"] = reasoning_status.get("subgoals", [])
+            state["runtime"]["memoryNavigationMode"] = reasoning_status.get("memoryNavigationMode")
+            state["runtime"]["resolvedMemoryObjectId"] = reasoning_status.get("resolvedMemoryObjectId")
+            state["runtime"]["resolvedMemoryPoseAgeSec"] = reasoning_status.get("resolvedMemoryPoseAgeSec")
+            state["runtime"]["reacquireState"] = reasoning_status.get("reacquireState")
             state["runtime"]["lastStatusEvent"] = {
-                "state": planner_status.get("task_status", "idle"),
-                "reason": planner_status.get("last_error"),
+                "state": reasoning_status.get("task_status", "idle"),
+                "reason": reasoning_status.get("last_error"),
             }
             if state["runtime"].get("executionMode") == "IDLE":
-                state["runtime"]["executionMode"] = "NAV" if planner_status.get("task_status") == "running" else "IDLE"
-            state["services"]["planner"] = {
-                "name": "planner",
-                "status": "healthy" if planner_status.get("ok", True) else "degraded",
-                "healthUrl": f"{self.app[PLANNER_SYSTEM_URL]}/planner/status",
-                "health": planner_status,
+                state["runtime"]["executionMode"] = "NAV" if state["runtime"]["reasoningTaskStatus"] == "running" else "IDLE"
+            state["services"]["reasoningSystem"] = {
+                "name": "reasoning_system",
+                "status": "healthy" if reasoning_status.get("ok", True) else "degraded",
+                "healthUrl": f"{self.app[REASONING_SYSTEM_URL]}/reasoning/status",
+                "health": reasoning_status,
             }
-            state["services"]["dual"] = dict(state["services"]["planner"])
-            state["architecture"]["mainControlServer"]["core"]["plannerCoordinator"]["status"] = "healthy"
-            state["architecture"]["mainControlServer"]["core"]["plannerCoordinator"]["summary"] = planner_status.get("task_status", "idle")
-            current_subgoal = planner_status.get("current_subgoal") or {}
-            state["architecture"]["mainControlServer"]["core"]["plannerCoordinator"]["detail"] = str(
-                current_subgoal.get("type") or planner_status.get("instruction") or ""
+            knowledge_payload = _as_dict(reasoning_status.get("knowledge"))
+            if knowledge_payload:
+                state["memory"].update(
+                    {
+                        "knowledgeEnabled": bool(knowledge_payload.get("enabled")),
+                        "publishedDocumentCount": int(knowledge_payload.get("published_document_count") or 0),
+                        "activeHardRuleCount": int(knowledge_payload.get("active_hard_rule_count") or 0),
+                        "lexiconEntryCount": int(knowledge_payload.get("lexicon_entry_count") or 0),
+                        "lastKnowledgeRefreshOk": knowledge_payload.get("last_refresh_ok"),
+                        "lastAppliedRuleIds": list(knowledge_payload.get("last_applied_rule_ids") or []),
+                        "knowledgeDegradedReason": knowledge_payload.get("degraded_reason"),
+                        "semanticRuleCount": int(knowledge_payload.get("active_hard_rule_count") or 0),
+                    }
+                )
+            if "agent_memory_available" in reasoning_status:
+                state["memory"].update(
+                    {
+                        "agentMemoryAvailable": bool(reasoning_status.get("agent_memory_available")),
+                        "agentMemoryCoreBlockCount": int(reasoning_status.get("agent_memory_core_block_count") or 0),
+                        "agentMemoryArchivalPassageCount": int(
+                            reasoning_status.get("agent_memory_archival_passage_count") or 0
+                        ),
+                        "agentMemoryDegradedReason": reasoning_status.get("agent_memory_degraded_reason"),
+                    }
+                )
+            state["architecture"]["mainControlServer"]["core"]["reasoningCoordinator"]["status"] = "healthy"
+            state["architecture"]["mainControlServer"]["core"]["reasoningCoordinator"]["summary"] = state["runtime"]["reasoningTaskStatus"]
+            current_subgoal = reasoning_status.get("current_subgoal") or {}
+            state["architecture"]["mainControlServer"]["core"]["reasoningCoordinator"]["detail"] = str(
+                current_subgoal.get("type") or reasoning_status.get("instruction") or ""
             )
         else:
-            planner_error = planner_result.get("error")
-            state["services"]["planner"]["status"] = "degraded"
-            state["services"]["planner"]["health"] = {"error": planner_error}
-            state["services"]["dual"] = dict(state["services"]["planner"])
+            reasoning_error = reasoning_result.get("error")
+            state["services"]["reasoningSystem"]["status"] = "degraded"
+            state["services"]["reasoningSystem"]["health"] = {"error": reasoning_error}
 
         if navigation_result.get("ok"):
             navigation_status = dict(navigation_result["status"])
@@ -587,10 +777,25 @@ class DashboardSessionManager:
             state["architecture"]["modules"]["nav"]["status"] = navigation_status.get("status", "unknown")
             state["architecture"]["modules"]["nav"]["summary"] = f"path pts {navigation_status.get('path_points', 0)}"
             state["architecture"]["modules"]["nav"]["detail"] = navigation_status.get("instruction") or ""
+            if navigation_status.get("memoryNavigationMode") == "memory_pose" and state["runtime"].get("executionMode") == "NAV":
+                state["runtime"]["executionMode"] = "MEM_NAV"
             state["runtime"]["routeState"] = {
                 "pathPoints": navigation_status.get("path_points", 0),
                 "trajectoryAgeSec": navigation_status.get("plan_age_s"),
             }
+            state["runtime"]["memoryNavigationMode"] = navigation_status.get("memoryNavigationMode")
+            state["runtime"]["resolvedMemoryObjectId"] = navigation_status.get("resolvedMemoryObjectId")
+            state["runtime"]["resolvedMemoryPoseAgeSec"] = navigation_status.get("resolvedMemoryPoseAgeSec")
+            state["runtime"]["reacquireState"] = navigation_status.get("reacquireState")
+            state["memory"].update(
+                {
+                    "memoryAwareTaskActive": bool(navigation_status.get("memoryAwareTaskActive")),
+                    "memoryNavigationMode": navigation_status.get("memoryNavigationMode"),
+                    "resolvedMemoryObjectId": navigation_status.get("resolvedMemoryObjectId"),
+                    "resolvedMemoryPoseAgeSec": navigation_status.get("resolvedMemoryPoseAgeSec"),
+                    "reacquireState": navigation_status.get("reacquireState"),
+                }
+            )
         else:
             state["architecture"]["modules"]["nav"]["status"] = "degraded"
             state["architecture"]["modules"]["nav"]["detail"] = str(navigation_result.get("error"))
@@ -656,11 +861,11 @@ class DashboardSessionManager:
             process=process_index.get("navigation_system"),
             session_active=session_active,
         )
-        state["services"]["plannerSystem"] = _server_service_snapshot(
-            name="planner_system",
-            health_url=f"{self.app[PLANNER_SYSTEM_URL]}/planner/status",
-            probe_result=planner_result,
-            process=process_index.get("planner_system"),
+        state["services"]["reasoningSystem"] = _server_service_snapshot(
+            name="reasoning_system",
+            health_url=f"{self.app[REASONING_SYSTEM_URL]}/reasoning/status",
+            probe_result=reasoning_result,
+            process=process_index.get("reasoning_system"),
             session_active=session_active,
         )
 
@@ -676,7 +881,7 @@ class DashboardSessionManager:
         if selected_target_summary is None:
             selected_target_summary = _selected_target_from_status(
                 runtime_status_payload,
-                planner_status_payload,
+                reasoning_status_payload,
                 navigation_status_payload,
             )
         state["selectedTargetSummary"] = selected_target_summary
@@ -686,9 +891,25 @@ class DashboardSessionManager:
             stdout_log = process.get("stdoutLog")
             stderr_log = process.get("stderrLog")
             if isinstance(stdout_log, str):
-                log_groups.append(tail_log(stdout_log, source=str(process["name"]), stream="stdout"))
+                stdout_offset = process.get("stdoutLogOffset")
+                log_groups.append(
+                    tail_log(
+                        stdout_log,
+                        source=str(process["name"]),
+                        stream="stdout",
+                        start_offset=stdout_offset if isinstance(stdout_offset, int) else None,
+                    )
+                )
             if isinstance(stderr_log, str):
-                log_groups.append(tail_log(stderr_log, source=str(process["name"]), stream="stderr"))
+                stderr_offset = process.get("stderrLogOffset")
+                log_groups.append(
+                    tail_log(
+                        stderr_log,
+                        source=str(process["name"]),
+                        stream="stderr",
+                        start_offset=stderr_offset if isinstance(stderr_offset, int) else None,
+                    )
+                )
         session_event = state["session"].get("lastEvent")
         state["logs"] = merge_logs(*log_groups, [session_event] if isinstance(session_event, dict) else [], limit=80)
         if latest_frame_state is not None:

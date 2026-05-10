@@ -25,6 +25,16 @@ def _require_video_dependencies() -> None:
         raise RuntimeError("aiortc and av are required for WebRTC video tracks.") from _VIDEO_IMPORT_ERROR
 
 
+def video_dependency_error_message() -> str:
+    if _VIDEO_IMPORT_ERROR is None:
+        return ""
+    return "aiortc and av are required for WebRTC video tracks."
+
+
+def video_dependencies_available() -> bool:
+    return _VIDEO_IMPORT_ERROR is None
+
+
 def _blank_rgb_frame(height: int, width: int) -> np.ndarray:
     return np.zeros((max(int(height), 1), max(int(width), 1), 3), dtype=np.uint8)
 

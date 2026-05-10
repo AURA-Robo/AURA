@@ -13,7 +13,7 @@ from typing import Any
 
 from .dashboard import LogRecord, ProcessRecord, ServiceSnapshot
 from .inference import System2Result
-from .navigation import NavDpPlan
+from .navigation import FollowerState, NavDpPlan, RobotState2D, make_follower_state
 from .observation import (
     HistoryView,
     LocomotionCommand,
@@ -26,6 +26,7 @@ from .observation import (
     encode_rgb_history_npz,
 )
 from .planner import Subgoal, TaskFrame
+from .reasoning import ReasoningRequest, ReasoningResponse, ReasoningRoute, ReasoningTaskPayload, RouteDecision
 
 _RUNTIME_STATE_EXPORTS = {
     "ActionOverrideState",
@@ -66,8 +67,10 @@ __all__ = [
     "GoalState",
     "HistoryView",
     "LogRecord",
+    "FollowerState",
     "LocomotionState",
     "LocomotionCommand",
+    "make_follower_state",
     "NavDpPlan",
     "NavDpState",
     "NavigationSessionSpec",
@@ -76,6 +79,11 @@ __all__ = [
     "ProcessRecord",
     "PlannerInput",
     "RawObservation",
+    "ReasoningRequest",
+    "ReasoningResponse",
+    "ReasoningRoute",
+    "ReasoningTaskPayload",
+    "RobotState2D",
     "ServiceSnapshot",
     "StatusState",
     "Subgoal",
@@ -84,4 +92,5 @@ __all__ = [
     "TaskExecutionState",
     "TaskFrame",
     "TrajectoryPlan",
+    "RouteDecision",
 ]

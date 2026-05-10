@@ -13,6 +13,7 @@ from systems.control.runtime_control_api import RuntimeControlApiServer
 from systems.memory.api.runtime import ShortTermMemory
 from systems.navigation.api.runtime import NavigationSystemClient, RobotState2D, yaw_from_quaternion_wxyz
 from systems.perception.api.camera_api import CameraPitchApiServer, G1NavCameraSensor, resolve_camera_control_prim_path
+from systems.perception.detector_runtime import InProcessDetectorRuntime
 from systems.perception.observation import PerceptionObservationService
 from systems.perception.telemetry import ViewerFramePublisher
 from systems.shared.contracts.observation import RawObservation
@@ -40,8 +41,17 @@ class NavigationRuntimeCoordinator:
         self._control_handler = control_handler
         self._navigation = NavigationSystemClient(server_url=args.navigation_url, timeout_s=args.navigation_timeout)
         self._memory = ShortTermMemory()
-        viewer_publisher = ViewerFramePublisher() if bool(getattr(args, "viewer_publish", True)) else None
-        self._perception = PerceptionObservationService(viewer_publisher=viewer_publisher)
+        self._viewer_publish_enabled = bool(getattr(args, "viewer_publish", True))
+        self._viewer_transport_error: str | None = None
+        viewer_publisher = self._create_viewer_publisher()
+        detector_runtime = InProcessDetectorRuntime(
+            enabled=bool(getattr(args, "detection_enabled", False)),
+            model_path=getattr(args, "detection_model_path", ""),
+        )
+        self._perception = PerceptionObservationService(
+            viewer_publisher=viewer_publisher,
+            detector_runtime=detector_runtime,
+        )
         self._controller = None
         self._sensor: G1NavCameraSensor | None = None
         self._camera_api_server: CameraPitchApiServer | None = None
@@ -153,14 +163,10 @@ class NavigationRuntimeCoordinator:
             return
 
         self._memory.observe(normalized)
-        if str(navigation_status.get("status")) == "idle":
-            idle_payload = self._idle_payload(normalized.stamp_s)
-            self._last_navigation_payload = dict(idle_payload)
-            self._control_handler.update_navigation_payload(idle_payload)
-            self._last_update_time = now
-            return
-
         try:
+            normalized_metadata = getattr(normalized, "metadata", {})
+            if not isinstance(normalized_metadata, dict):
+                normalized_metadata = {}
             self._submit_navigation_update(
                 _NavigationUpdateRequest(
                     generation=self._rpc_generation,
@@ -176,6 +182,7 @@ class NavigationRuntimeCoordinator:
                         "lin_vel_b": robot_state.lin_vel_b,
                         "yaw_rate": robot_state.yaw_rate,
                         "stamp_s": normalized.stamp_s,
+                        "detections": self._compact_detections(normalized_metadata),
                     },
                 ),
             )
@@ -196,7 +203,12 @@ class NavigationRuntimeCoordinator:
 
     def runtime_status(self) -> dict[str, object]:
         control_status = dict(self._control_handler.runtime_status())
-        control_status["viewer"] = self._perception.latest_health()
+        viewer_status = self._perception.latest_health()
+        viewer_status["enabled"] = self._viewer_publish_enabled and self._viewer_transport_error is None
+        if self._viewer_transport_error is not None:
+            viewer_status["status"] = "degraded"
+            viewer_status["last_error"] = self._viewer_transport_error
+        control_status["viewer"] = viewer_status
         control_status["navigation"] = self._navigation_snapshot()
         control_status["last_error"] = self._last_error or control_status.get("last_error")
         return control_status
@@ -241,6 +253,19 @@ class NavigationRuntimeCoordinator:
         if update_result is not None and update_result.generation == generation:
             self._apply_navigation_update_result(update_result)
 
+    def _create_viewer_publisher(self) -> ViewerFramePublisher | None:
+        if not self._viewer_publish_enabled:
+            return None
+        try:
+            return ViewerFramePublisher()
+        except Exception as exc:  # noqa: BLE001
+            self._viewer_transport_error = f"{type(exc).__name__}: {exc}"
+            print(
+                "[WARN] Viewer transport disabled; control runtime will continue without dashboard frames. "
+                f"Reason: {self._viewer_transport_error}"
+            )
+            return None
+
     def _apply_navigation_status_result(self, result: _NavigationWorkerResult) -> None:
         if result.error is not None:
             self._last_error = result.error
@@ -262,6 +287,12 @@ class NavigationRuntimeCoordinator:
     def _apply_navigation_update_result(self, result: _NavigationWorkerResult) -> None:
         payload = result.payload
         if payload is None:
+            return
+        if str(payload.get("status") or "").strip().lower() == "idle":
+            self._last_navigation_status = dict(payload)
+            self._last_navigation_payload = dict(payload)
+            self._last_error = result.error
+            self._control_handler.update_navigation_payload(payload)
             return
         if not self._should_accept_navigation_payload(payload):
             return
@@ -557,6 +588,38 @@ class NavigationRuntimeCoordinator:
         if goal_world_xyz is not None:
             summary["world_pose_xyz"] = goal_world_xyz
         return summary
+
+    @staticmethod
+    def _compact_detections(metadata: dict[str, object]) -> list[dict[str, object]]:
+        detections = metadata.get("detections")
+        if not isinstance(detections, list):
+            return []
+        compact_rows: list[dict[str, object]] = []
+        for item in detections:
+            if not isinstance(item, dict):
+                continue
+            class_name = item.get("class_name")
+            if not isinstance(class_name, str) or not class_name.strip():
+                continue
+            row: dict[str, object] = {"class_name": class_name.strip()}
+            class_id = item.get("class_id")
+            if isinstance(class_id, (int, float)) and not isinstance(class_id, bool):
+                row["class_id"] = int(round(float(class_id)))
+            track_id = item.get("track_id")
+            if isinstance(track_id, str) and track_id.strip():
+                row["track_id"] = track_id.strip()
+            bbox_xyxy = item.get("bbox_xyxy")
+            if isinstance(bbox_xyxy, (list, tuple)) and len(bbox_xyxy) >= 4:
+                row["bbox_xyxy"] = list(bbox_xyxy[:4])
+            for key in ("confidence", "depth_m"):
+                numeric = item.get(key)
+                if isinstance(numeric, (int, float)) and not isinstance(numeric, bool):
+                    row[key] = float(numeric)
+            world_pose_xyz = item.get("world_pose_xyz")
+            if isinstance(world_pose_xyz, (list, tuple)) and len(world_pose_xyz) >= 3:
+                row["world_pose_xyz"] = list(world_pose_xyz[:3])
+            compact_rows.append(row)
+        return compact_rows
 
     @staticmethod
     def _pixel_pair(value: object) -> list[int] | None:

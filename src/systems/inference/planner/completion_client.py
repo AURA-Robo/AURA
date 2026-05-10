@@ -12,9 +12,16 @@ class PlannerClientError(RuntimeError):
 
 
 CompletionFn = Callable[[list[dict[str, str]], str, float, float, int], str]
+DEFAULT_PLANNER_INTENT_SLOT_ID = 0
+DEFAULT_PLANNER_TASK_FRAME_SLOT_ID = 1
 
 
-def make_http_completion(base_url: str) -> CompletionFn:
+def make_http_completion(
+    base_url: str,
+    *,
+    slot_id: int | None = None,
+    cache_prompt: bool | None = None,
+) -> CompletionFn:
     def complete(
         messages: list[dict[str, str]],
         model: str,
@@ -29,6 +36,10 @@ def make_http_completion(base_url: str) -> CompletionFn:
         }
         if model:
             body["model"] = model
+        if slot_id is not None:
+            body["id_slot"] = int(slot_id)
+        if cache_prompt is not None:
+            body["cache_prompt"] = bool(cache_prompt)
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             base_url,
@@ -53,6 +64,24 @@ def make_http_completion(base_url: str) -> CompletionFn:
         return content
 
     return complete
+
+
+def make_planner_intent_completion(
+    base_url: str,
+    *,
+    slot_id: int = DEFAULT_PLANNER_INTENT_SLOT_ID,
+    cache_prompt: bool = True,
+) -> CompletionFn:
+    return make_http_completion(base_url, slot_id=slot_id, cache_prompt=cache_prompt)
+
+
+def make_planner_task_frame_completion(
+    base_url: str,
+    *,
+    slot_id: int = DEFAULT_PLANNER_TASK_FRAME_SLOT_ID,
+    cache_prompt: bool = True,
+) -> CompletionFn:
+    return make_http_completion(base_url, slot_id=slot_id, cache_prompt=cache_prompt)
 
 
 def strip_code_fences(text: str) -> str:
@@ -103,6 +132,25 @@ def extract_json_object(text: str) -> dict[str, Any]:
         raise PlannerClientError(f"LLM response contained invalid JSON: {exc}") from exc
 
 
+def call_json_completion(
+    completion: CompletionFn,
+    messages: list[dict[str, str]],
+    model: str,
+    timeout: float,
+    temperature: float,
+    max_tokens: int,
+    validator,
+) -> dict[str, Any]:
+    raw_content = completion(list(messages), model, timeout, temperature, max_tokens)
+    try:
+        parsed = extract_json_object(raw_content)
+        return validator(parsed)
+    except Exception as exc:  # noqa: BLE001
+        raise PlannerClientError(
+            f"LLM returned invalid JSON or failed validation. Last response: {raw_content}"
+        ) from exc
+
+
 def call_json_with_retry(
     completion: CompletionFn,
     messages: list[dict[str, str]],
@@ -112,29 +160,12 @@ def call_json_with_retry(
     max_tokens: int,
     validator,
 ) -> dict[str, Any]:
-    current_messages = list(messages)
-    last_error: Exception | None = None
-    last_content = ""
-    for attempt in range(2):
-        raw_content = completion(current_messages, model, timeout, temperature, max_tokens)
-        last_content = raw_content
-        try:
-            parsed = extract_json_object(raw_content)
-            return validator(parsed)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt == 1:
-                break
-            current_messages = list(messages) + [
-                {"role": "assistant", "content": raw_content},
-                {
-                    "role": "user",
-                    "content": (
-                        "Your previous answer was invalid. "
-                        f"Problem: {exc}. Reply again with exactly one valid JSON object and nothing else."
-                    ),
-                },
-            ]
-    raise PlannerClientError(
-        f"LLM returned invalid JSON after 2 attempts. Last response: {last_content}"
-    ) from last_error
+    return call_json_completion(
+        completion,
+        messages,
+        model,
+        timeout,
+        temperature,
+        max_tokens,
+        validator,
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import time
+from typing import Any
 
 import numpy as np
 
@@ -69,6 +70,7 @@ class ObservationSubscriber:
         *,
         bus: ZmqBus | None = None,
         shm_ring: SharedMemoryRing | None = None,
+        object_memory_sink: Any | None = None,
     ) -> None:
         self.config = config
         self._bus = bus or ZmqBus(
@@ -81,7 +83,10 @@ class ObservationSubscriber:
         self._shm_ring = shm_ring
         self._owns_shm = shm_ring is None
         self._task: asyncio.Task[None] | None = None
+        self._object_memory_task: asyncio.Task[None] | None = None
+        self._object_memory_queue: asyncio.Queue[FrameCache] | None = None
         self._frame: FrameCache | None = None
+        self.object_memory_sink = object_memory_sink
         self._seq = 0
         self._latest_health: dict[str, object] = {}
         self._stream_stalled = False
@@ -89,6 +94,11 @@ class ObservationSubscriber:
         self._decode_drops = 0
         self._shm_overwrite_drops = 0
         self._stale_transitions = 0
+        self._latest_frame_drops = 0
+        self._object_memory_queued = 0
+        self._object_memory_queue_drops = 0
+        self._object_memory_processed = 0
+        self._object_memory_errors = 0
 
     @property
     def current_frame(self) -> FrameCache | None:
@@ -100,16 +110,30 @@ class ObservationSubscriber:
 
     @property
     def debug_counters(self) -> dict[str, int]:
+        queue_depth = 0 if self._object_memory_queue is None else int(self._object_memory_queue.qsize())
         return {
             "decodeOk": int(self._decode_ok),
             "decodeDrops": int(self._decode_drops),
             "shmOverwriteDrops": int(self._shm_overwrite_drops),
             "staleTransitions": int(self._stale_transitions),
+            "latestFrameDrops": int(self._latest_frame_drops),
+            "objectMemoryQueued": int(self._object_memory_queued),
+            "objectMemoryQueueDrops": int(self._object_memory_queue_drops),
+            "objectMemoryProcessed": int(self._object_memory_processed),
+            "objectMemoryErrors": int(self._object_memory_errors),
+            "objectMemoryQueueDepth": queue_depth,
         }
 
     async def start(self) -> None:
         if self._task is not None:
             return
+        if self.object_memory_sink is not None:
+            queue_size = max(int(self.config.object_memory_queue_size), 1)
+            self._object_memory_queue = asyncio.Queue(maxsize=queue_size)
+            self._object_memory_task = asyncio.create_task(
+                self._object_memory_loop(),
+                name="backend-webrtc-object-memory",
+            )
         self._task = asyncio.create_task(self._poll_loop(), name="backend-webrtc-subscriber")
 
     async def close(self) -> None:
@@ -118,6 +142,12 @@ class ObservationSubscriber:
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        if self._object_memory_task is not None:
+            self._object_memory_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._object_memory_task
+            self._object_memory_task = None
+            self._object_memory_queue = None
         if self._owns_shm and self._shm_ring is not None:
             self._shm_ring.close()
             self._shm_ring = None
@@ -155,9 +185,13 @@ class ObservationSubscriber:
                     self._latest_health = dict(details.get("viewer", {})) if isinstance(details.get("viewer", {}), dict) else {}
                 processed += 1
 
-            for record in self._bus.poll(VIEWER_OBSERVATION_TOPIC, max_items=32):
+            latest_record, dropped_count = self._poll_latest_observation()
+            if dropped_count:
+                self._latest_frame_drops += int(dropped_count)
+
+            if latest_record is not None:
                 processed += 1
-                header = record.message
+                header = latest_record.message
                 metadata = dict(header.metadata)
                 try:
                     rgb = self._decode_rgb(metadata)
@@ -185,17 +219,69 @@ class ObservationSubscriber:
                     viewer_overlay=dict(overlay),
                     last_frame_monotonic=time.monotonic(),
                 )
+                self._queue_object_memory_frame(self._frame)
                 self._decode_ok += 1
                 self._update_stream_stalled(self._frame)
 
             await asyncio.sleep(0.0 if processed > 0 else sleep_interval)
 
-    def _attach_shm_if_needed(self) -> None:
-        if self._shm_ring is not None or not self._owns_shm:
+    def _poll_latest_observation(self):
+        latest_record = None
+        seen_count = 0
+        max_batches = max(int(self.config.latest_frame_drain_batches), 1)
+        for _index in range(max_batches):
+            batch = self._bus.poll(VIEWER_OBSERVATION_TOPIC, max_items=32)
+            if not batch:
+                break
+            seen_count += len(batch)
+            latest_record = batch[-1]
+            if len(batch) < 32:
+                break
+        return latest_record, max(seen_count - 1, 0)
+
+    def _queue_object_memory_frame(self, frame: FrameCache) -> None:
+        if self.object_memory_sink is None:
             return
+        queue = self._object_memory_queue
+        if queue is None:
+            return
+        if queue.full():
+            with suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+                queue.task_done()
+                self._object_memory_queue_drops += 1
+        try:
+            queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            self._object_memory_queue_drops += 1
+            return
+        self._object_memory_queued += 1
+
+    async def _object_memory_loop(self) -> None:
+        assert self._object_memory_queue is not None
+        queue = self._object_memory_queue
+        while True:
+            frame = await queue.get()
+            try:
+                if self.object_memory_sink is not None:
+                    await asyncio.to_thread(self.object_memory_sink.observe_frame, frame)
+                    self._object_memory_processed += 1
+            except Exception:  # noqa: BLE001
+                self._object_memory_errors += 1
+            finally:
+                queue.task_done()
+
+    def _attach_shm_if_needed(self, shm_name: str | None = None) -> None:
+        target_name = str(shm_name or self.config.shm_name)
+        if not self._owns_shm:
+            return
+        if self._shm_ring is not None and self._shm_ring.name == target_name:
+            return
+        if self._shm_ring is not None:
+            self._reset_shm()
         try:
             self._shm_ring = SharedMemoryRing(
-                name=str(self.config.shm_name),
+                name=target_name,
                 slot_size=int(self.config.shm_slot_size),
                 capacity=int(self.config.shm_capacity),
                 create=False,
@@ -210,13 +296,19 @@ class ObservationSubscriber:
         self._shm_ring = None
 
     def _decode_rgb(self, metadata: dict[str, object]) -> np.ndarray | None:
-        if self._shm_ring is not None and isinstance(metadata.get("rgb_ref"), dict):
-            return decode_ndarray(self._shm_ring.read(ref_from_dict(metadata["rgb_ref"])))
+        if isinstance(metadata.get("rgb_ref"), dict):
+            ref = ref_from_dict(metadata["rgb_ref"])
+            self._attach_shm_if_needed(ref.name)
+            if self._shm_ring is not None:
+                return decode_ndarray(self._shm_ring.read(ref))
         return None
 
     def _decode_depth(self, metadata: dict[str, object]) -> np.ndarray | None:
-        if self._shm_ring is not None and isinstance(metadata.get("depth_ref"), dict):
-            return decode_ndarray(self._shm_ring.read(ref_from_dict(metadata["depth_ref"])))
+        if isinstance(metadata.get("depth_ref"), dict):
+            ref = ref_from_dict(metadata["depth_ref"])
+            self._attach_shm_if_needed(ref.name)
+            if self._shm_ring is not None:
+                return decode_ndarray(self._shm_ring.read(ref))
         return None
 
     def _stream_fields(self, frame: FrameCache) -> dict[str, object]:

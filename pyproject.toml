@@ -7,6 +7,28 @@ name = "isaac-aura"
 version = "0.0.0"
 description = "Subsystem-oriented Isaac Aura runtime packages."
 requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "numpy>=1.26,<2",
+    "Pillow>=10,<12",
+    "psycopg[binary]>=3.2,<3.3",
+    "pyzmq>=25,<27",
+    "PyYAML>=6,<7",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-aiohttp>=1,<2",
+]
+webrtc = [
+    "aiortc>=1.9,<2",
+    "av>=12,<16",
+]
+vision = [
+    "ultralytics>=8.3,<9",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -79,6 +79,29 @@ class _BlockingNavigationClient(_FakeNavigationClient):
         }
 
 
+class _IdleNavigationClient(_FakeNavigationClient):
+    def status(self) -> dict[str, object]:
+        self.status_calls += 1
+        return {"status": "idle", "trajectory_world_xy": []}
+
+    def update(self, **_kwargs) -> dict[str, object]:
+        self.update_calls += 1
+        self.last_update_kwargs = dict(_kwargs)
+        return {
+            "status": "idle",
+            "instruction": None,
+            "task_id": None,
+            "session_id": None,
+            "trajectory_world_xy": [],
+            "stamp_s": 12.5,
+            "current_robot_pose": {
+                "world_xyz": [0.0, 0.0, 0.8],
+                "world_xy": [0.0, 0.0],
+                "yaw_rad": 0.0,
+            },
+        }
+
+
 class _FakeMemory:
     def __init__(self) -> None:
         self.observe_calls = 0
@@ -213,6 +236,66 @@ def test_runtime_coordinator_keeps_capturing_while_navigation_update_runs_in_bac
         assert control_handler.payloads[0]["status"] == "running"
     finally:
         coordinator._navigation.release.set()
+        coordinator.shutdown()
+
+
+def test_runtime_coordinator_degrades_when_viewer_transport_bind_fails() -> None:
+    args = SimpleNamespace(
+        viewer_publish=True,
+        navigation_url="http://127.0.0.1:17882",
+        navigation_timeout=1.0,
+        navigation_update_hz=1.0,
+    )
+    control_handler = _FakeControlHandler()
+    with patch(
+        "simulation.application.runtime_coordinator.ViewerFramePublisher",
+        side_effect=PermissionError("tcp://127.0.0.1:18881"),
+    ):
+        coordinator = NavigationRuntimeCoordinator(args, control_handler=control_handler)
+    try:
+        status = coordinator.runtime_status()
+
+        assert status["viewer"]["enabled"] is False
+        assert status["viewer"]["status"] == "degraded"
+        assert "PermissionError" in status["viewer"]["last_error"]
+        assert "18881" in status["viewer"]["last_error"]
+    finally:
+        coordinator.shutdown()
+
+
+def test_runtime_coordinator_publishes_idle_pose_to_navigation_status() -> None:
+    args = SimpleNamespace(
+        viewer_publish=False,
+        navigation_url="http://127.0.0.1:17882",
+        navigation_timeout=1.0,
+        navigation_update_hz=1.0,
+    )
+    control_handler = _FakeControlHandler()
+    coordinator = NavigationRuntimeCoordinator(args, control_handler=control_handler)
+    coordinator._navigation = _IdleNavigationClient()
+    coordinator._memory = _FakeMemory()
+    coordinator._perception = _FakePerception()
+    coordinator._controller = _FakeController()
+    coordinator._sensor = _FakeSensor()
+    coordinator._last_navigation_status = {"status": "idle"}
+    coordinator._last_status_time = 100.0
+
+    try:
+        with patch("simulation.application.runtime_coordinator.time.monotonic", return_value=100.0):
+            coordinator.step()
+
+        assert _wait_until(lambda: coordinator._completed_update_result is not None)
+        coordinator._consume_navigation_worker_results()
+
+        assert coordinator._navigation.update_calls == 1
+        assert coordinator._navigation.last_update_kwargs is not None
+        np.testing.assert_allclose(
+            np.asarray(coordinator._navigation.last_update_kwargs["base_pos_w"], dtype=np.float32),
+            np.asarray([0.0, 0.0, 0.8], dtype=np.float32),
+        )
+        assert coordinator._last_navigation_status["current_robot_pose"]["world_xy"] == [0.0, 0.0]
+        assert control_handler.payloads[-1]["current_robot_pose"]["world_xy"] == [0.0, 0.0]
+    finally:
         coordinator.shutdown()
 
 

@@ -36,6 +36,9 @@ logs/
 tmp/
 state/
 parent-session-runs/
+subagent-runs/
+/*.log
+/*.png
 
 # Local-only orchestration and agent metadata
 .claude/
