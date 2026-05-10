@@ -25,7 +25,6 @@ if not defined AURA_CMD_MAX_WZ set "AURA_CMD_MAX_WZ=0.8"
 if not defined SCENE_USD set "SCENE_USD="
 if not defined ENV_URL set "ENV_URL=/Isaac/Environments/Simple_Warehouse/warehouse.usd"
 if not defined POLICY set "POLICY=%REPO_DIR%\artifacts\models\g1_policy_fp16.engine"
-if not defined CONFIG_DIR set "CONFIG_DIR=%REPO_DIR%\tuned\params"
 if not defined ROBOT_USD set "ROBOT_USD=%REPO_DIR%\robots\g1\g1_d455.usd"
 
 if not defined SCENE_USD (
@@ -63,13 +62,15 @@ if /I "%AURA_DETECTION_ENABLED%"=="off" set "DETECTION_FLAG=--no-detection-enabl
 if /I "%AURA_DETECTION_ENABLED%"=="no" set "DETECTION_FLAG=--no-detection-enabled"
 set "SCENE_USD_FLAG="
 if defined SCENE_USD set SCENE_USD_FLAG=--scene_usd "%SCENE_USD%"
+set "CONFIG_DIR_FLAG="
+if defined CONFIG_DIR set CONFIG_DIR_FLAG=--config_dir "%CONFIG_DIR%"
 
 pushd "%REPO_DIR%"
 set "PYTHONPATH=%REPO_DIR%\src"
 
 call "%ISAACSIM_PYTHON%" -m systems.control.api.play_g1_internvla_navdp ^
     --policy "%POLICY%" ^
-    --config_dir "%CONFIG_DIR%" ^
+    %CONFIG_DIR_FLAG% ^
     --robot_usd "%ROBOT_USD%" ^
     --env_url "%ENV_URL%" ^
     %SCENE_USD_FLAG% ^

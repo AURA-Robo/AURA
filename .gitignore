@@ -45,6 +45,9 @@ subagent-runs/
 .codex/
 AGENTS.md
 agents.md
+skills/
+src/systems/*/CONTEXT.md
+src/systems/*/context.md
 
 # Generated or externally managed assets
 artifacts/
